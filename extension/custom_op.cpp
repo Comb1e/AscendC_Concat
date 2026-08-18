@@ -9,46 +9,18 @@
 #include <torch/extension.h>
 #include <torch/csrc/autograd/custom_function.h>
 #include "../common/pytorch_npu_helper.hpp"
-using torch::autograd::Function;
-using torch::autograd::AutogradContext;
 using tensor_list = std::vector<at::Tensor>;
-using namespace at;
 
 
-at::Tensor my_op_impl_npu(const tensor_list inputs, int64_t dim, 
-                    const at::IntArrayRef& output_shape ) {
-    
-    auto round = 30 ;
-    at::Tensor result;
+at::Tensor my_op_impl_npu(const tensor_list inputs, int64_t dim,
+                          const at::IntArrayRef& output_shape) {
+    TORCH_CHECK(!inputs.empty(), "concat expects at least one input tensor");
 
-    auto a = at::empty(
-        {4096, 4096},
-        at::TensorOptions()
-            .device(at::kPrivateUse1)  // 昇腾NPU固定设备标识 kPrivateUse1
-            .dtype(at::kFloat)         // float32
-    );
-    auto b = at::empty(
-        {4096, 4096},
-        at::TensorOptions()
-            .device(at::kPrivateUse1)  // 昇腾NPU固定设备标识 kPrivateUse1
-            .dtype(at::kFloat)         // float32
-    );
-    auto c = at::empty(
-        {4096, 4096},
-        at::TensorOptions()
-            .device(at::kPrivateUse1)  // 昇腾NPU固定设备标识 kPrivateUse1
-            .dtype(at::kFloat)         // float32
-    );
-
-    for (size_t i = 0; i < round; i++)
-    {
-        at::TensorList inputs_x = at::TensorList(inputs);
-        result = at::empty(
-            output_shape, 
-            inputs[0].options()  // 复用input的dtype/device（NPU）
-        );
-        EXEC_NPU_CMD(aclnnMul, a, b, c);
-        EXEC_NPU_CMD(aclnnConcat, inputs_x, dim, result);
+    at::Tensor result = at::empty(output_shape, inputs.front().options());
+    at::TensorList input_list(inputs);
+    constexpr size_t kBenchmarkRounds = 30;
+    for (size_t i = 0; i < kBenchmarkRounds; ++i) {
+        EXEC_NPU_CMD(aclnnCat, input_list, dim, result);
     }
     return result;
 }
