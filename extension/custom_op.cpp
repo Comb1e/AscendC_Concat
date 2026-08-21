@@ -127,5 +127,5 @@ TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("custom_op", &concat_impl_npu, "torch.cat");
+    m.def("concat", &concat_impl_npu, "torch.cat");
 }

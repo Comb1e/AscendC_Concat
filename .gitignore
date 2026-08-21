@@ -1,2 +1,5 @@
 torch_npu-2.5.1.post1-cp39-cp39-manylinux_2_17_aarch64.manylinux2014_aarch64.whl
 torch-2.5.1-cp39-cp39-manylinux_2_17_aarch64.manylinux2014_aarch64.whl
+dist/
+build/
+custom_ops.egg-info/
