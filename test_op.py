@@ -4,11 +4,11 @@ from torch_npu.testing.testcase import TestCase, run_tests
 import custom_ops_lib
 torch.npu.config.allow_internal_format = False
 import numpy as np
-import sys  
+import sys
 import random
 
 case_data = {
-    'case1': {
+    'case2': {
         'input': np.random.uniform(-500, 500, [128,256]).astype(np.float16),
         'dim': -1,
         'max_step': 64
@@ -70,7 +70,7 @@ def generate_random_split_sizes(total_len: int, max_step: int) -> list[int]:
             break
 
     return split_sizes
-    
+
 def unpack_tensor_by_dim(
     tensor: torch.Tensor,
     split_sizes: list[int],
@@ -88,11 +88,11 @@ def unpack_tensor_by_dim(
     # torch.split原生支持size=0
     chunks = torch.split(tensor, split_sizes, dim=dim)
     return list(chunks)
-    
+
 class TestCustomOP(TestCase):
     def test_custom_op_case(self,num):
         print(num)
-        caseName='case'+str(num) 
+        caseName='case'+str(num)
 
         input_x = torch.from_numpy(case_data[caseName]["input"])
         print(input_x.shape)
@@ -119,4 +119,4 @@ class TestCustomOP(TestCase):
 
 if __name__ == "__main__":
     TestCustomOP().test_custom_op_case(sys.argv[1])
-    
+

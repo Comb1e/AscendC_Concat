@@ -101,7 +101,7 @@ std::vector<int64_t> ValidateAndInferShape(const tensor_list& inputs,
 
 }  // namespace
 
-at::Tensor my_op_impl_npu(const tensor_list& inputs, int64_t dim,
+at::Tensor concat_impl_npu(const tensor_list& inputs, int64_t dim,
                           const at::IntArrayRef& output_shape) {
     const std::vector<int64_t> expected_shape =
         ValidateAndInferShape(inputs, dim);
@@ -119,13 +119,13 @@ at::Tensor my_op_impl_npu(const tensor_list& inputs, int64_t dim,
 }
 
 TORCH_LIBRARY(myops, m) {
-    m.def("my_op(Tensor[] inputs, int dim, int[] output_shape) -> Tensor");
+    m.def("concat(Tensor[] inputs, int dim, int[] output_shape) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
-    m.impl("my_op", &my_op_impl_npu);
+    m.impl("concat", &concat_impl_npu);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("custom_op", &my_op_impl_npu, "torch.cat");
+    m.def("custom_op", &concat_impl_npu, "torch.cat");
 }
