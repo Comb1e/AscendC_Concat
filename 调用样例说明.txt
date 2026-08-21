@@ -1,0 +1,8 @@
+算子调用案例编写可采用pybind方式，调用样例可参考提供的赛题case，以及samples仓AddCustom样例参考链接：
+https://gitee.com/ascend/samples/tree/master/operator/ascendc/0_introduction/1_add_frameworklaunch/CppExtensionInvocation
+
+pybind相关依赖参考使用同目录下init_pybind.sh脚本安装。
+
+pybind样例执行前会在各赛题提供的样例下的dist/目录编译生成whl文件并安装，执行不同的算子case需要重新安装该whl包。
+测试可自行添加测试case{num}，并执行bash run.sh {num}，num为1时将重装whl包
+
