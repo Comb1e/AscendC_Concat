@@ -73,7 +73,23 @@ Concat 不做数值计算，Kernel 使用 `uint8_t` 原始字节搬运统一覆�
 | `b30737a` | 每核改为连续均衡 outer 区间；在 UB 容量内合并多行 `DataCopyPad` | 减少小 inner、大 outer 场景的逐行 DMA 与循环开销 | 910B 非对齐 UB 行按 32B 计空间，blockCount 不超过 4095，stride 超限时回退单行 |
 | `faff960` | Host 下发 `allSegmentsAligned`；全对齐场景使用普通 `DataCopy` | 避免对齐输入承担 `DataCopyPad` 开销 | 任一片段非对齐时必须完整保留 Pad 路径 |
 
-当前推荐测试版本为 `faff960`。
+### 首轮 NPU 反馈与原因分析
+
+累计版本 `faff960`（测试时仓库 HEAD 为文档提交 `f815893`）五例均通过精度，但性能为：
+
+| Case | 原始基线/us | `faff960`/us | 差值/us | 变化率 |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 18.024 | 19.804 | +1.780 | +9.88% |
+| 2 | 31.668 | 34.172 | +2.504 | +7.91% |
+| 3 | 21.568 | 21.388 | -0.180 | -0.83% |
+| 4 | 110.300 | 113.036 | +2.736 | +2.48% |
+| 5 | 1643.632 | 1653.960 | +10.328 | +0.63% |
+| 合计 | 1825.192 | 1842.360 | +17.168 | +0.94% |
+
+这不是某个大数据 Case 独有的退化：除 Case3 的 `0.18 us` 小幅波动外，其余规模均变慢。
+最先隔离全局作用的 L2 bypass，因为测试会对同一批输入连续调用算子，默认 L2 缓存可能保留
+输入数据；强制 bypass 会让每次调用重新访问 HBM，并且 Case5 的绝对退化最大。本提交仅恢复
+默认 L2 策略，其余五项优化保持不变，作为下一轮可独立归因的测试点。
 
 ### 调优示例的取舍
 
@@ -103,8 +119,8 @@ bash build.sh
 先测试当前累计版本：
 
 ```bash
-git log --oneline -8
-# 历史中应包含 faff960；当前 HEAD 还会包含后续文档提交
+git log --oneline -10
+# 历史中应包含 faff960 和恢复默认 L2 缓存的后续试验提交
 
 bash build.sh
 # 按比赛环境原有流程安装 custom_*.run，运行精度与五个性能样例
@@ -114,13 +130,13 @@ bash build.sh
 
 ```text
 commit: <git rev-parse --short HEAD 的输出>
-code_baseline: faff960
+code_baseline: <git rev-parse --short HEAD 的输出>
 soc/cann: <version>
 correctness: pass|fail
 times_us: <case1>, <case2>, <case3>, <case4>, <case5>
 ```
 
-若当前版本精度失败，先测试 `b30737a`，以隔离对齐快路径。若精度正确但性能回退，建议依次测试：
+若恢复默认 L2 后仍回退，可测试 `f815893` 复现首轮结果，或依次测试旧累计版本：
 
 ```text
 b30737a -> 128fea9 -> 92e6de8 -> 61555ba -> fd2f8ab

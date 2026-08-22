@@ -77,7 +77,6 @@ __aicore__ inline void ProcessByRows(ListTensorDesc& inputs, GlobalTensor<uint8_
         const uint64_t segmentBytes = desc.GetShape(tilingData.concatDim) * innerSize * tilingData.elementBytes;
         GlobalTensor<uint8_t> source;
         source.SetGlobalBuffer(inputs.GetDataPtr<uint8_t>(inputIdx));
-        source.SetL2CacheHint(CacheMode::CACHE_MODE_DISABLE);
 
         uint64_t copied = 0;
         while (copied < segmentBytes) {
@@ -141,7 +140,6 @@ __aicore__ inline void ProcessByChunks(ListTensorDesc& inputs, GlobalTensor<uint
 
         GlobalTensor<uint8_t> source;
         source.SetGlobalBuffer(inputs.GetDataPtr<uint8_t>(inputIdx));
-        source.SetL2CacheHint(CacheMode::CACHE_MODE_DISABLE);
         for (uint64_t workItem = firstWorkItem; workItem < inputWorkItems; workItem += blockCount) {
             const uint64_t outer = workItem / chunkCount;
             const uint64_t chunk = workItem - outer * chunkCount;
