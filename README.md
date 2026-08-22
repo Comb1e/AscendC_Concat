@@ -94,6 +94,9 @@ Concat 不做数值计算，Kernel 使用 `uint8_t` 原始字节搬运统一覆�
 | `375a67a` | 本地结果增加均值，并自动生成包含 commit 和所有 Case 的 Markdown 简表 | 固化同环境比较口径，避免手工转录和版本标签歧义 | HEAD 默认代表源码；测试旧安装包时需显式传实际 commit |
 | `8dc7a78` | 显式回退 `f3aa07d`，保留 32 输入预加载 | 隔离第二次 mode 2 负反馈 | 32 输入扩展仍需单独上板归因 |
 | `9f07f4a` | 在保持活跃核数时将普通搬运 tile 扩展到 96 KiB，并保留 64/32 KiB 回退 | 利用 910B 的 192 KiB UB，减少大流式 Case 的 DMA 和循环次数 | 两个 96 KiB Buffer 用满 UB；必须验证 Kernel 编译、阈值和大数据性能 |
+| `0e38813` | 显式回退 `9f07f4a` | 恢复 64/32 KiB tile 和双 Buffer 余量 | 保留 32 输入预加载及 mode 2 回退 |
+| `b702aec` | 保持 chunk 数不变，在每个输入片段内部均衡 chunk 字节数 | 避免略大于 tile 的片段产生大块与极小尾块、造成核间字节失衡 | chunk 路径每个多块片段增加均分计算 |
+| `d430bc0` | 单 chunk 和零长度片段跳过均分除法 | 避免不受益输入承担新增 Scalar 成本 | 多 chunk 路径保持 `b702aec` 行为 |
 
 ### 首轮 NPU 反馈与原因分析
 
@@ -413,6 +416,33 @@ Case 能验证精度、阈值和相对分支行为，却没有复现官方 Case5
 可能严重不均。计划保持每段 chunk 数不变，将段内 chunk 长度重新均分并对齐到 32B，以不改变
 核占用和 DMA 次数的方式缩小长尾核负载。
 
+### 下一轮实验：均衡段内 chunk 字节数
+
+提交 `0e38813` 已完整撤销 96 KiB 实验，当前重新使用经过官方反馈的 64/32 KiB tile。提交
+`b702aec` 只修改 `ProcessByChunks` 的段内边界。对片段字节数 `S` 和原 tile `T`：
+
+```text
+chunkCount = ceil(S / T)
+balancedChunkBytes = align_up(ceil(S / chunkCount), 32)
+chunkStart = chunkIndex * balancedChunkBytes
+chunkBytes = min(balancedChunkBytes, S - chunkStart)
+```
+
+`chunkCount`、`inputWorkItems`、全局 work-item 编号和 blockDim 均不改变，因此不会减少活跃核或
+增加 DMA 命令。所有段内区间仍从 0 连续覆盖到 `S`，源地址和目标地址只把原固定 tile 偏移替换
+为均衡偏移。对齐片段的首地址、均衡块长和尾块仍全部 32B 对齐，继续使用普通 `DataCopy`；
+非对齐片段继续完整使用 `DataCopyPad`。
+
+极端例子是 40 个 `65568B` 对齐片段。旧方案将每段切为 `65536+32B`，80 个工作项分给 40 核后，
+每核总字节范围可达到 `64～131072B`；新方案切为 `32800+32768B`，范围收敛到
+`65536～65600B`。`chunk_imbalanced_aligned` 固定覆盖该场景；
+`chunk_imbalanced_unaligned` 使用 40 个 `65537B` 片段，覆盖 `65536+1B` 尾块和 Pad 路径。
+随机 10000 组片段/tile 静态检查已确认新边界连续、无遗漏和重叠。
+
+新增均分需要多块片段每核、每输入执行一次整数除法。提交 `d430bc0` 将计算限制为
+`chunkCount > 1`，单 chunk、零长度输入和全部 row 调度不增加该成本。主要未知是隐藏 Case5
+是否确实包含大量略大于 tile 的片段；若片段本来已是整 tile 或远大于 tile，收益会较小。
+
 ### 下一轮实验：复用 Host 预加载的片段字节数
 
 提交 `2c97dca` 使用当前 Host 已写入 Tiling 的前 16 个输入 `segmentBytes`。此前普通
@@ -475,7 +505,7 @@ bash build.sh
 `aclnnMul`，并在
 `op_summary*.csv` 中只收集名称包含 `Concat` 的任务。
 
-六个诊断 Case 分别覆盖：
+诊断 Case 分别覆盖：
 
 | 名称 | 主要用途 |
 | --- | --- |
@@ -491,8 +521,8 @@ bash build.sh
 | `max_inputs` | ACLNN 256 输入上限的描述符回退路径 |
 | `rank4_axis0` | Rank4 首轴拼接、负/正轴地址模型和零长度片段 |
 | `tile_tail` | 输出行跨越 64 KiB tile 且存在非整 tile 尾块 |
-| `tile_medium_occupancy` | 单个 3 MiB 片段，验证 96 KiB 不足以填核时回退 64 KiB |
-| `tile_large_occupancy` | 单个 4.6875 MiB 片段，验证 96 KiB 双 Buffer 的大流式吞吐 |
+| `chunk_imbalanced_aligned` | 40 个 `65568B` 对齐片段，放大固定 tile 的核间字节失衡 |
+| `chunk_imbalanced_unaligned` | 40 个 `65537B` 非对齐片段，验证均衡尾块的 Pad 路径 |
 
 测试工具所需的 ACLNN/PyTorch NPU helper 已复制到
 `local_test/common/pytorch_npu_helper.hpp`，运行时不依赖 `test-ref/`，整个
@@ -617,7 +647,7 @@ PERF_RESULT name=<case> samples=20 median_us=<time> mean_us=<time> min_us=<time>
 
 ```bash
 git log --oneline -12
-# 当前待测版本保留 32 输入预加载、删除 mode 2，并自适应选择 32/64/96 KiB tile
+# 当前待测版本恢复 64/32 KiB tile，并在多 chunk 片段内均衡各工作项字节数
 
 bash build.sh
 # 按比赛环境原有流程安装 custom_*.run，运行精度与五个性能样例
@@ -633,13 +663,12 @@ correctness: pass|fail
 times_us: <case1>, <case2>, <case3>, <case4>, <case5>
 ```
 
-本地测试优先回传 `ref`、`preload_16`、`preload_17`、`chunk_aligned`、
-`tile_medium_occupancy`、`tile_large_occupancy` 和 `max_inputs`；其中 `ref` 对应已知 Case2 的
-`[128, 256]` FP16、9 个非对齐随机片段，`preload_16/17` 覆盖元数据边界，三个大段 Case
-覆盖 32/64/96 KiB tile 选择，`max_inputs` 覆盖描述符回退。测试扩展已构建时无需因 Python
-Case 改动执行 `--build`。当前 `9f07f4a` 应与本轮官方 `574.7515 us` 和此前最好
-`573.612 us` 同时比较；若 96 KiB 回退，先新建 revert 提交撤销 `9f07f4a`，所得版本即
-`8dc7a78` 的“32 输入预加载、无 mode 2”隔离方案。
+本地测试优先回传 `ref`、`chunk_aligned`、`chunk_imbalanced_aligned`、
+`chunk_imbalanced_unaligned` 和 `max_inputs`。前两个检查普通回归，两个新 Case 直接验证字节
+均衡假设，`max_inputs` 覆盖描述符回退。测试扩展已构建时无需因 Python Case 改动执行
+`--build`。当前版本应与本轮官方 `585.256 us`、上一轮 `574.7515 us` 和历史最好
+`573.612 us` 同时比较。若新 chunk 调度回退，先新建 revert 提交依次撤销 `d430bc0` 和
+`b702aec`；`0e38813` 是恢复 64/32 KiB、保留 32 输入预加载且不含 mode 2 的隔离点。
 
 更早的累计版本顺序为：
 
