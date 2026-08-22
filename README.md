@@ -36,8 +36,10 @@ CONCAT_TECHNICAL_DOCUMENT.md
 此前已补充 L2 策略应按输入/输出生命周期分别实验、性能复现需要匹配分配器和中间算子的
 缓存行为、算子规格与 ACLNN 动态列表上限需要分开确认，以及“0 target tasks”通常是启动前
 错误的连带结果。本轮进一步记录：对齐输出行大于 UB 时，可按输出 tile 与输入前缀区间求交
-继续融合写回，并且只应在保持活跃核数时启用；框架每轮创建新 Tensor 不代表物理输出地址
-只写一次，缓存分配器可能复用存储并反转 L2 实验结果。更新后的 skill 已通过
+继续融合写回，但保持活跃核数仍不足以保证收益，还必须核算逐 tile 的 Scalar 映射和访问局部性；
+Host 已下发 bounded 输入的精确片段长度时，Kernel 应直接复用并保留超限描述符回退；框架每轮
+创建新 Tensor 不代表物理输出地址只写一次，缓存分配器可能复用存储并反转 L2 实验结果；本地
+诊断结果只能作为同环境后续提交的基线，不能直接解释隐藏 Case。更新后的 skill 已通过
 `skill-creator` 的 `quick_validate.py` 校验。
 
 ## Kernel 地址模型
@@ -85,6 +87,7 @@ Concat 不做数值计算，Kernel 使用 `uint8_t` 原始字节搬运统一覆�
 | `b717f0a` | 删除输出 L2 bypass，恢复 `b041908` 的默认缓存策略 | 消除所有 Case 的一致性回退 | 保留更贴近官方生命周期的测试封装 |
 | `618125d` | 对齐大行按输出 tile 在 UB 中组装后单次写回 | 合并跨输入边界的 MTE3，重点改善大搬运 Case | 仅在不减少活跃 AIV 数时启用 |
 | `d6a5a57` | 删除对齐大行输出 tile 融合，恢复历史最优 Kernel | 消除逐 tile 输入扫描和区间计算 | Host/Kernel 与 `b717f0a` 完全一致 |
+| `2c97dca` | 16 输入以内复用 Host 预加载片段长度，融合行每核缓存输入地址 | 减少 `GetDesc`、shape 乘积和重复 TensorList 地址读取 | 多输入通用路径保持原实现 |
 
 ### 首轮 NPU 反馈与原因分析
 
@@ -239,16 +242,26 @@ Scalar 控制开销；按输出 tile 交错访问不同输入还可能弱化旧 
 
 ### 下一轮实验：复用 Host 预加载的片段字节数
 
-当前 Host 已将前 16 个输入的 `segmentBytes` 写入 Tiling，但普通 row/chunk Kernel 仍对每个
-输入调用 `GetDesc`，将 shape 从 GM 复制到核侧缓冲，再循环计算 `innerSize` 和
-`segmentBytes`。下一轮在 `inputCount <= 16` 时直接读取 Tiling 中的 `segmentBytes`，并只用
+提交 `2c97dca` 使用当前 Host 已写入 Tiling 的前 16 个输入 `segmentBytes`。此前普通
+row/chunk Kernel 仍对每个输入调用 `GetDesc`，将 shape 从 GM 复制到核侧缓冲，再循环计算 `innerSize` 和
+`segmentBytes`。现在 `inputCount <= 16` 时直接读取 Tiling 中的 `segmentBytes`，并只用
 `GetDataPtr` 获取动态输入地址；超过 16 输入时保留原描述符路径。该实验不改变 work-item、
 tile、DMA 参数、缓存策略或源/目标地址公式，重点降低小数据、多输入和高核数场景的 Scalar
 元数据成本。
 
+已有的对齐整行融合路径原本在每个 UB batch 内重新遍历 TensorList 获取输入地址。由于该路径
+本来就限制为最多 16 输入，当前版本在每核开始时读取一次非空输入地址，后续 batch 直接复用；
+这样不改变每批 MTE2/MTE3 次数，但避免 `batchCount * inputCount` 次地址解析。指针数组形式已在
+此前通过官方精度测试的 `618125d` 中使用过，当前只是将其用于已验证有收益的整行融合路径。
+
 官方 API 文档证明 `GetDataPtr` 可以独立取得动态列表数据地址；本机内置 Concat 的预加载长度
 策略说明 Host 预计算后避免重复 shape 解析是已有实现模式。预计本地 `ref`（9 输入）最能观察
 小数据元数据收益；`many_inputs` 有 256 输入，会继续走通用描述符路径，应该保持不变。
+
+静态复算固定随机拆分后，`ref/row_unaligned/row_aligned/chunk_aligned/fused_tiles` 的输入数依次为
+`9/11/10/16/16`，均进入新路径；`many_inputs=256` 是通用路径对照。对 Rank 1-4、每个合法轴、
+四种元素字节宽度随机生成的 10000 组 shape，Host `segmentBytes` 与旧 Kernel shape 乘积公式完全
+一致。该检查只证明元数据公式等价，不替代 CANN Kernel 编译、NPU 精度或性能测试。
 
 此前 mode 2 的地址模型本身仍然正确：
 
@@ -392,7 +405,7 @@ bash local_test/run.sh fused_tiles
 
 `fused_tiles=11.040 us` 说明 mode 2 在刻意构造的跨边界大行上可以快速执行，但没有同环境旧
 版本结果，不能单独证明它比旧 chunk 路径更快；官方总表已经表明该策略不适合当前隐藏样例。
-下一版应在同一环境重跑全部六例，以 `ref` 观察 16 输入以内的 shape 解析消除效果，以
+`2c97dca` 应在同一环境重跑全部六例，以 `ref` 观察 16 输入以内的 shape 解析消除效果，以
 `many_inputs` 作为超过预加载上限的通用路径对照，并记录撤销 mode 2 后 `fused_tiles` 的变化。
 
 每个 Case 成功时输出两行便于直接回传：
