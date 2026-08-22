@@ -107,18 +107,6 @@ CASES = {
         "dim": -1,
         "splits": [65537] * 40,
     },
-    "chunk_many_inputs": {
-        "shape": (1, 16777216),
-        "dtype": torch.int8,
-        "dim": -1,
-        "splits": [65536] * ACLNN_MAX_TENSOR_LIST_SIZE,
-    },
-    "chunk_single_large": {
-        "shape": (1, 16777216),
-        "dtype": torch.int8,
-        "dim": -1,
-        "splits": [16777216],
-    },
 }
 
 

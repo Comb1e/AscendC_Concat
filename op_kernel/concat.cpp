@@ -191,12 +191,11 @@ __aicore__ inline void ProcessByChunks(ListTensorDesc& inputs, GlobalTensor<uint
                                       const ConcatTilingData& tilingData, Queue& queue)
 {
     const uint32_t blockIdx = GetBlockIdx();
-    uint32_t inputIdx = tilingData.chunkStartInput[blockIdx];
-    uint64_t inputWorkItem = tilingData.chunkStartWork[blockIdx];
-    uint64_t remainingWorkItems = tilingData.chunkWorkCount[blockIdx];
-    uint64_t outputInputOffset = tilingData.chunkOutputOffset[blockIdx];
+    const uint32_t blockCount = GetBlockNum();
+    uint64_t globalChunkBase = 0;
+    uint64_t outputInputOffset = 0;
 
-    while (remainingWorkItems != 0 && inputIdx < tilingData.inputCount) {
+    for (uint32_t inputIdx = 0; inputIdx < tilingData.inputCount; ++inputIdx) {
         GlobalTensor<uint8_t> source;
         const uint64_t segmentBytes = LoadInput(inputs, inputIdx, tilingData, source);
         const uint64_t chunkCount = CeilDivU64(segmentBytes, tilingData.tileBytes);
@@ -206,9 +205,10 @@ __aicore__ inline void ProcessByChunks(ListTensorDesc& inputs, GlobalTensor<uint
             balancedChunkBytes = CeilDivU64(averageChunkBytes, kDataBlockBytes) * kDataBlockBytes;
         }
         const uint64_t inputWorkItems = tilingData.outerSize * chunkCount;
-        const uint64_t currentWorkItems = MinU64(remainingWorkItems, inputWorkItems - inputWorkItem);
-        const uint64_t workEnd = inputWorkItem + currentWorkItems;
-        for (uint64_t workItem = inputWorkItem; workItem < workEnd; ++workItem) {
+        const uint64_t firstWorkItem =
+            (blockIdx + blockCount - globalChunkBase % blockCount) % blockCount;
+
+        for (uint64_t workItem = firstWorkItem; workItem < inputWorkItems; workItem += blockCount) {
             const uint64_t outer = workItem / chunkCount;
             const uint64_t chunk = workItem - outer * chunkCount;
             const uint64_t copied = chunk * balancedChunkBytes;
@@ -218,10 +218,8 @@ __aicore__ inline void ProcessByChunks(ListTensorDesc& inputs, GlobalTensor<uint
             CopyBytes(output, outputOffset + copied, source, outer * segmentBytes + copied, bytes,
                       tilingData.allSegmentsAligned != 0, queue);
         }
-        remainingWorkItems -= currentWorkItems;
+        globalChunkBase += inputWorkItems;
         outputInputOffset += segmentBytes;
-        inputWorkItem = 0;
-        ++inputIdx;
     }
 }
 }  // namespace

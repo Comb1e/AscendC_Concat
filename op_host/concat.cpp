@@ -4,7 +4,6 @@
 #include <cstdint>
 #include <initializer_list>
 #include <limits>
-#include <vector>
 
 #include "register/op_def_registry.h"
 #include "tiling/platform/platform_ascendc.h"
@@ -13,43 +12,6 @@ namespace {
 constexpr uint32_t kSmallTileBytes = 32U * 1024U;
 constexpr uint32_t kLargeTileBytes = 64U * 1024U;
 constexpr uint32_t kFallbackVectorCores = 40U;
-
-uint64_t CeilDiv(uint64_t value, uint64_t divisor)
-{
-    return value == 0 ? 0 : 1 + (value - 1) / divisor;
-}
-
-uint64_t BalancedChunkBytes(uint64_t segmentBytes, uint32_t tileBytes)
-{
-    const uint64_t chunkCount = CeilDiv(segmentBytes, tileBytes);
-    if (chunkCount <= 1) {
-        return segmentBytes;
-    }
-    const uint64_t averageBytes = CeilDiv(segmentBytes, chunkCount);
-    return CeilDiv(averageBytes, 32U) * 32U;
-}
-
-uint64_t FindChunkWorkBoundary(uint64_t targetBytes, uint64_t outerSize,
-                               const std::vector<uint64_t>& segmentBytesList, uint32_t tileBytes)
-{
-    uint64_t byteBase = 0;
-    uint64_t workBase = 0;
-    for (const uint64_t segmentBytes : segmentBytesList) {
-        const uint64_t chunkCount = CeilDiv(segmentBytes, tileBytes);
-        const uint64_t inputBytes = outerSize * segmentBytes;
-        const uint64_t inputWorkItems = outerSize * chunkCount;
-        if (targetBytes < byteBase + inputBytes && segmentBytes != 0) {
-            const uint64_t bytesWithinInput = targetBytes - byteBase;
-            const uint64_t outer = bytesWithinInput / segmentBytes;
-            const uint64_t bytesWithinOuter = bytesWithinInput - outer * segmentBytes;
-            const uint64_t chunkBytes = BalancedChunkBytes(segmentBytes, tileBytes);
-            return workBase + outer * chunkCount + CeilDiv(bytesWithinOuter, chunkBytes);
-        }
-        byteBase += inputBytes;
-        workBase += inputWorkItems;
-    }
-    return workBase;
-}
 
 bool NormalizeDim(int64_t rawDim, size_t rank, uint32_t& dim)
 {
@@ -101,8 +63,6 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
     uint64_t smallChunksPerOuter = 0;
     uint64_t largeChunksPerOuter = 0;
     uint64_t preloadedSegmentBytes[optiling::kPreloadedSegmentCount] = {};
-    std::vector<uint64_t> segmentBytesList;
-    segmentBytesList.reserve(inputCount);
     bool allSegmentsAligned = true;
     for (size_t i = 0; i < inputCount; ++i) {
         const auto* storageShape = context->GetDynamicInputShape(0, i);
@@ -124,7 +84,6 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
         if (i < optiling::kPreloadedSegmentCount) {
             preloadedSegmentBytes[i] = segmentBytes;
         }
-        segmentBytesList.push_back(segmentBytes);
         outputRowBytes += segmentBytes;
         smallChunksPerOuter += (segmentBytes + kSmallTileBytes - 1) / kSmallTileBytes;
         largeChunksPerOuter += (segmentBytes + kLargeTileBytes - 1) / kLargeTileBytes;
@@ -147,54 +106,12 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
     const uint64_t rowWorkItems = outerSize;
     const uint64_t chunkWorkItems = outerSize * chunksPerOuter;
     const uint64_t rowCoreCount = std::min<uint64_t>(maxCoreCount, rowWorkItems);
-    const uint64_t chunkCoreCount = std::min<uint64_t>(
-        std::min<uint32_t>(maxCoreCount, optiling::kChunkScheduleCoreCount), chunkWorkItems);
+    const uint64_t chunkCoreCount = std::min<uint64_t>(maxCoreCount, chunkWorkItems);
     // Keep the lower-overhead row path unless chunking activates more AIV cores.
     const bool rowSchedule = chunkCoreCount <= rowCoreCount;
+    const uint64_t workItems = rowSchedule ? rowWorkItems : chunkWorkItems;
     const uint32_t blockDim = static_cast<uint32_t>(
-        std::max<uint64_t>(1, rowSchedule ? rowCoreCount : chunkCoreCount));
-
-    uint32_t chunkStartInput[optiling::kChunkScheduleCoreCount] = {};
-    uint64_t chunkStartWork[optiling::kChunkScheduleCoreCount] = {};
-    uint64_t chunkWorkCount[optiling::kChunkScheduleCoreCount] = {};
-    uint64_t chunkOutputOffset[optiling::kChunkScheduleCoreCount] = {};
-    if (!rowSchedule) {
-        uint64_t boundaries[optiling::kChunkScheduleCoreCount + 1] = {};
-        boundaries[blockDim] = chunkWorkItems;
-        const uint64_t totalBytes = outerSize * outputRowBytes;
-        for (uint32_t core = 1; core < blockDim; ++core) {
-            const uint64_t targetBytes = (totalBytes / blockDim) * core +
-                                         (totalBytes % blockDim) * core / blockDim;
-            uint64_t boundary = FindChunkWorkBoundary(targetBytes, outerSize, segmentBytesList, tileBytes);
-            boundary = std::max<uint64_t>(boundary, boundaries[core - 1] + 1);
-            boundary = std::min<uint64_t>(boundary, chunkWorkItems - (blockDim - core));
-            boundaries[core] = boundary;
-        }
-
-        uint32_t inputIdx = 0;
-        uint64_t inputWorkBase = 0;
-        uint64_t outputInputOffset = 0;
-        for (uint32_t core = 0; core < blockDim; ++core) {
-            const uint64_t globalStart = boundaries[core];
-            while (inputIdx < inputCount) {
-                const uint64_t chunkCount = CeilDiv(segmentBytesList[inputIdx], tileBytes);
-                const uint64_t inputWorkItems = outerSize * chunkCount;
-                if (globalStart < inputWorkBase + inputWorkItems) {
-                    break;
-                }
-                inputWorkBase += inputWorkItems;
-                outputInputOffset += segmentBytesList[inputIdx];
-                ++inputIdx;
-            }
-            if (inputIdx >= inputCount) {
-                return ge::GRAPH_FAILED;
-            }
-            chunkStartInput[core] = inputIdx;
-            chunkStartWork[core] = globalStart - inputWorkBase;
-            chunkWorkCount[core] = boundaries[core + 1] - globalStart;
-            chunkOutputOffset[core] = outputInputOffset;
-        }
-    }
+        std::max<uint64_t>(1, std::min<uint64_t>(maxCoreCount, workItems)));
 
     ConcatTilingData tiling;
     tiling.set_outerSize(outerSize);
@@ -206,15 +123,8 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
     tiling.set_tileBytes(tileBytes);
     tiling.set_allSegmentsAligned(allSegmentsAligned ? 1U : 0U);
     tiling.set_segmentBytes(preloadedSegmentBytes);
-    tiling.set_chunkStartInput(chunkStartInput);
-    tiling.set_chunkStartWork(chunkStartWork);
-    tiling.set_chunkWorkCount(chunkWorkCount);
-    tiling.set_chunkOutputOffset(chunkOutputOffset);
 
     context->SetBlockDim(blockDim);
-    if (tiling.GetDataSize() > context->GetRawTilingData()->GetCapacity()) {
-        return ge::GRAPH_FAILED;
-    }
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
     return ge::GRAPH_SUCCESS;
