@@ -33,22 +33,23 @@ __aicore__ inline void ProcessByRows(ListTensorDesc& inputs, GlobalTensor<uint8_
 {
     const uint32_t blockIdx = GetBlockIdx();
     const uint32_t blockCount = GetBlockNum();
-    for (uint64_t outer = blockIdx; outer < tilingData.outerSize; outer += blockCount) {
-        uint64_t outputOffset = outer * tilingData.outputRowBytes;
-        for (uint32_t inputIdx = 0; inputIdx < tilingData.inputCount; ++inputIdx) {
-            uint64_t shapeBuffer[kMaxRank];
-            TensorDesc<uint8_t> desc;
-            desc.SetShapeAddr(shapeBuffer);
-            inputs.GetDesc(desc, inputIdx);
+    uint64_t outputInputOffset = 0;
+    for (uint32_t inputIdx = 0; inputIdx < tilingData.inputCount; ++inputIdx) {
+        uint64_t shapeBuffer[kMaxRank];
+        TensorDesc<uint8_t> desc;
+        desc.SetShapeAddr(shapeBuffer);
+        inputs.GetDesc(desc, inputIdx);
 
-            uint64_t innerSize = 1;
-            for (uint32_t axis = tilingData.concatDim + 1; axis < desc.GetDim(); ++axis) {
-                innerSize *= desc.GetShape(axis);
-            }
-            const uint64_t segmentBytes = desc.GetShape(tilingData.concatDim) * innerSize * tilingData.elementBytes;
-            GlobalTensor<uint8_t> source;
-            source.SetGlobalBuffer(inputs.GetDataPtr<uint8_t>(inputIdx));
+        uint64_t innerSize = 1;
+        for (uint32_t axis = tilingData.concatDim + 1; axis < desc.GetDim(); ++axis) {
+            innerSize *= desc.GetShape(axis);
+        }
+        const uint64_t segmentBytes = desc.GetShape(tilingData.concatDim) * innerSize * tilingData.elementBytes;
+        GlobalTensor<uint8_t> source;
+        source.SetGlobalBuffer(inputs.GetDataPtr<uint8_t>(inputIdx));
 
+        for (uint64_t outer = blockIdx; outer < tilingData.outerSize; outer += blockCount) {
+            const uint64_t outputOffset = outer * tilingData.outputRowBytes + outputInputOffset;
             uint64_t copied = 0;
             while (copied < segmentBytes) {
                 const uint32_t bytes = static_cast<uint32_t>(
@@ -56,8 +57,8 @@ __aicore__ inline void ProcessByRows(ListTensorDesc& inputs, GlobalTensor<uint8_
                 CopyBytes(output, outputOffset + copied, source, outer * segmentBytes + copied, bytes, queue);
                 copied += bytes;
             }
-            outputOffset += segmentBytes;
         }
+        outputInputOffset += segmentBytes;
     }
 }
 
@@ -68,36 +69,38 @@ __aicore__ inline void ProcessByChunks(ListTensorDesc& inputs, GlobalTensor<uint
     const uint32_t blockIdx = GetBlockIdx();
     const uint32_t blockCount = GetBlockNum();
     uint64_t globalChunkBase = 0;
+    uint64_t outputInputOffset = 0;
 
-    for (uint64_t outer = 0; outer < tilingData.outerSize; ++outer) {
-        uint64_t outputOffset = outer * tilingData.outputRowBytes;
-        for (uint32_t inputIdx = 0; inputIdx < tilingData.inputCount; ++inputIdx) {
-            uint64_t shapeBuffer[kMaxRank];
-            TensorDesc<uint8_t> desc;
-            desc.SetShapeAddr(shapeBuffer);
-            inputs.GetDesc(desc, inputIdx);
+    for (uint32_t inputIdx = 0; inputIdx < tilingData.inputCount; ++inputIdx) {
+        uint64_t shapeBuffer[kMaxRank];
+        TensorDesc<uint8_t> desc;
+        desc.SetShapeAddr(shapeBuffer);
+        inputs.GetDesc(desc, inputIdx);
 
-            uint64_t innerSize = 1;
-            for (uint32_t axis = tilingData.concatDim + 1; axis < desc.GetDim(); ++axis) {
-                innerSize *= desc.GetShape(axis);
-            }
-            const uint64_t segmentBytes = desc.GetShape(tilingData.concatDim) * innerSize * tilingData.elementBytes;
-            const uint64_t chunkCount = (segmentBytes + tilingData.tileBytes - 1) / tilingData.tileBytes;
+        uint64_t innerSize = 1;
+        for (uint32_t axis = tilingData.concatDim + 1; axis < desc.GetDim(); ++axis) {
+            innerSize *= desc.GetShape(axis);
+        }
+        const uint64_t segmentBytes = desc.GetShape(tilingData.concatDim) * innerSize * tilingData.elementBytes;
+        const uint64_t chunkCount = (segmentBytes + tilingData.tileBytes - 1) / tilingData.tileBytes;
+
+        GlobalTensor<uint8_t> source;
+        source.SetGlobalBuffer(inputs.GetDataPtr<uint8_t>(inputIdx));
+        for (uint64_t outer = 0; outer < tilingData.outerSize; ++outer) {
+            const uint64_t workBase = globalChunkBase + outer * chunkCount;
             const uint64_t firstChunk =
-                (blockIdx + blockCount - globalChunkBase % blockCount) % blockCount;
+                (blockIdx + blockCount - workBase % blockCount) % blockCount;
 
-            GlobalTensor<uint8_t> source;
-            source.SetGlobalBuffer(inputs.GetDataPtr<uint8_t>(inputIdx));
             for (uint64_t chunk = firstChunk; chunk < chunkCount; chunk += blockCount) {
                 const uint64_t copied = chunk * tilingData.tileBytes;
                 const uint32_t bytes = static_cast<uint32_t>(
                     MinU64(tilingData.tileBytes, segmentBytes - copied));
+                const uint64_t outputOffset = outer * tilingData.outputRowBytes + outputInputOffset;
                 CopyBytes(output, outputOffset + copied, source, outer * segmentBytes + copied, bytes, queue);
             }
-
-            globalChunkBase += chunkCount;
-            outputOffset += segmentBytes;
         }
+        globalChunkBase += tilingData.outerSize * chunkCount;
+        outputInputOffset += segmentBytes;
     }
 }
 }  // namespace
