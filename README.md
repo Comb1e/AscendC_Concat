@@ -114,6 +114,49 @@ bash build.sh
 
 本次开发环境没有 NPU。曾启动本地构建并完成 Host 编译、进入 Kernel 生成阶段，但按要求提前停止，因此不能把当前版本声明为完整编译通过或 NPU 验证通过。
 
+## 本地快速测试
+
+`local_test/` 根据 `test-ref/` 的比赛调用链编写，仍通过 `EXEC_NPU_CMD(aclnnConcat, ...)`
+调用本项目自定义算子。每个 Case 连续执行 30 次，丢弃前 10 次后报告后 20 次
+`Task Duration(us)` 中位数。与参考脚本相比，它移除了无关 `aclnnMul`，并在
+`op_summary*.csv` 中只收集名称包含 `Concat` 的任务。
+
+五个诊断 Case 分别覆盖：
+
+| 名称 | 主要用途 |
+| --- | --- |
+| `ref` | 复现参考目录中的 `[128, 256]`、FP16、末轴随机拆分 |
+| `row_unaligned` | 多 outer 行、非 32B 对齐片段和多行 `DataCopyPad` |
+| `row_aligned` | 多 outer 行、32B 对齐片段和普通 `DataCopy` |
+| `chunk_aligned` | `outerSize=1` 的大对齐片段、多核 chunk 调度 |
+| `many_inputs` | 约数百个小片段，放大动态 TensorList 元数据开销 |
+
+测试工具复用 `test-ref/common/pytorch_npu_helper.hpp`，因此运行时需保留用户提供的
+`test-ref/` 目录。先重新构建、安装当前算子包，再首次构建测试扩展并运行全部 Case：
+
+```bash
+bash build.sh
+# 安装本次 build_out/custom_*.run 后执行：
+bash local_test/run.sh all --build
+```
+
+后续只修改并重新安装算子包时，无需重建测试 wheel：
+
+```bash
+bash local_test/run.sh all
+# 也可只跑一个分支，例如：
+bash local_test/run.sh ref
+```
+
+每个 Case 成功时输出两行便于直接回传：
+
+```text
+CASE_RESULT name=<case> correctness=pass
+PERF_RESULT name=<case> samples=20 median_us=<time> min_us=<time> max_us=<time>
+```
+
+此环境没有 NPU，因此上述测试脚本只完成源代码和 Shell 静态检查，未在本机实际执行。
+
 ## NPU 验证
 
 先测试当前累计版本：
