@@ -26,6 +26,38 @@ CASES = {
         "max_step": 64,
         "split_alignment": 1,
     },
+    "row_unaligned_fp32": {
+        "shape": (1024, 257),
+        "dtype": torch.float32,
+        "dim": -1,
+        "max_step": 64,
+        "split_alignment": 1,
+    },
+    "row_unaligned_int8": {
+        "shape": (1024, 257),
+        "dtype": torch.int8,
+        "dim": -1,
+        "max_step": 64,
+        "split_alignment": 1,
+    },
+    "compact_limit": {
+        "shape": (64, 4096),
+        "dtype": torch.float16,
+        "dim": -1,
+        "splits": [257] * 15 + [241],
+    },
+    "compact_over_limit": {
+        "shape": (64, 4097),
+        "dtype": torch.float16,
+        "dim": -1,
+        "splits": [257] * 15 + [242],
+    },
+    "compact_zero_segments": {
+        "shape": (256, 257),
+        "dtype": torch.float16,
+        "dim": -1,
+        "splits": [0, 1, 0, 3, 5, 248],
+    },
     "row_aligned": {
         "shape": (4096, 1024),
         "dtype": torch.float32,
