@@ -53,6 +53,48 @@ CASES = {
         "max_step": 64,
         "split_alignment": 1,
     },
+    "single_input": {
+        "shape": (256, 4096),
+        "dtype": torch.float16,
+        "dim": -1,
+        "splits": [4096],
+    },
+    "zero_segments": {
+        "shape": (8, 256),
+        "dtype": torch.int32,
+        "dim": -1,
+        "splits": [0, 64, 0, 192],
+    },
+    "preload_16": {
+        "shape": (32, 512),
+        "dtype": torch.float32,
+        "dim": -1,
+        "splits": [32] * 16,
+    },
+    "preload_17": {
+        "shape": (32, 544),
+        "dtype": torch.float32,
+        "dim": -1,
+        "splits": [32] * 17,
+    },
+    "max_inputs": {
+        "shape": (2, 256),
+        "dtype": torch.int8,
+        "dim": -1,
+        "splits": [1] * ACLNN_MAX_TENSOR_LIST_SIZE,
+    },
+    "rank4_axis0": {
+        "shape": (8, 4, 8, 16),
+        "dtype": torch.float16,
+        "dim": 0,
+        "splits": [0, 1, 2, 5],
+    },
+    "tile_tail": {
+        "shape": (2, 70000),
+        "dtype": torch.int8,
+        "dim": -1,
+        "splits": [65536, 4464],
+    },
 }
 
 
