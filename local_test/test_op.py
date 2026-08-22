@@ -95,6 +95,18 @@ CASES = {
         "dim": -1,
         "splits": [65536, 4464],
     },
+    "tile_medium_occupancy": {
+        "shape": (1, 3145728),
+        "dtype": torch.int8,
+        "dim": -1,
+        "splits": [3145728],
+    },
+    "tile_large_occupancy": {
+        "shape": (1, 4915200),
+        "dtype": torch.int8,
+        "dim": -1,
+        "splits": [4915200],
+    },
 }
 
 

@@ -10,7 +10,8 @@
 
 namespace {
 constexpr uint32_t kSmallTileBytes = 32U * 1024U;
-constexpr uint32_t kLargeTileBytes = 64U * 1024U;
+constexpr uint32_t kMediumTileBytes = 64U * 1024U;
+constexpr uint32_t kLargeTileBytes = 96U * 1024U;
 constexpr uint32_t kFallbackVectorCores = 40U;
 
 bool NormalizeDim(int64_t rawDim, size_t rank, uint32_t& dim)
@@ -61,6 +62,7 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
     const uint64_t innerSize = Product(firstShape, concatDim + 1, rank);
     uint64_t outputRowBytes = 0;
     uint64_t smallChunksPerOuter = 0;
+    uint64_t mediumChunksPerOuter = 0;
     uint64_t largeChunksPerOuter = 0;
     uint64_t preloadedSegmentBytes[optiling::kPreloadedSegmentCount] = {};
     bool allSegmentsAligned = true;
@@ -86,6 +88,7 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
         }
         outputRowBytes += segmentBytes;
         smallChunksPerOuter += (segmentBytes + kSmallTileBytes - 1) / kSmallTileBytes;
+        mediumChunksPerOuter += (segmentBytes + kMediumTileBytes - 1) / kMediumTileBytes;
         largeChunksPerOuter += (segmentBytes + kLargeTileBytes - 1) / kLargeTileBytes;
         allSegmentsAligned = allSegmentsAligned && segmentBytes % 32U == 0;
     }
@@ -99,10 +102,19 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
         }
     }
 
+    const uint64_t mediumChunkWorkItems = outerSize * mediumChunksPerOuter;
     const uint64_t largeChunkWorkItems = outerSize * largeChunksPerOuter;
-    const bool largeTileKeepsCoreOccupancy = outerSize >= maxCoreCount || largeChunkWorkItems >= maxCoreCount;
-    const uint32_t tileBytes = largeTileKeepsCoreOccupancy ? kLargeTileBytes : kSmallTileBytes;
-    const uint64_t chunksPerOuter = largeTileKeepsCoreOccupancy ? largeChunksPerOuter : smallChunksPerOuter;
+    const bool rowsFillCores = outerSize >= maxCoreCount;
+    uint32_t tileBytes = kSmallTileBytes;
+    uint64_t chunksPerOuter = smallChunksPerOuter;
+    if (rowsFillCores || largeChunkWorkItems >= maxCoreCount) {
+        // Ascend 910B has 192 KiB UB; the bound queue uses two 96 KiB buffers.
+        tileBytes = kLargeTileBytes;
+        chunksPerOuter = largeChunksPerOuter;
+    } else if (mediumChunkWorkItems >= maxCoreCount) {
+        tileBytes = kMediumTileBytes;
+        chunksPerOuter = mediumChunksPerOuter;
+    }
     const uint64_t rowWorkItems = outerSize;
     const uint64_t chunkWorkItems = outerSize * chunksPerOuter;
     const uint64_t rowCoreCount = std::min<uint64_t>(maxCoreCount, rowWorkItems);
