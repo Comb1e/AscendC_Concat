@@ -58,6 +58,24 @@ CASES = {
         "dim": -1,
         "splits": [0, 1, 0, 3, 5, 248],
     },
+    "compact_offset_aligned": {
+        "shape": (64, 256),
+        "dtype": torch.float16,
+        "dim": -1,
+        "splits": [8, 24] * 8,
+    },
+    "compact_output_tail": {
+        "shape": (128, 257),
+        "dtype": torch.float16,
+        "dim": -1,
+        "splits": [7, 9, 15, 17, 31, 33, 49, 96],
+    },
+    "compact_batch_one": {
+        "shape": (40, 4096),
+        "dtype": torch.float16,
+        "dim": -1,
+        "splits": [257] * 15 + [241],
+    },
     "row_aligned": {
         "shape": (4096, 1024),
         "dtype": torch.float32,
