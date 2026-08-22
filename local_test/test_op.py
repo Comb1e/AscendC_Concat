@@ -9,6 +9,8 @@ import concat_profile_lib
 
 torch.npu.config.allow_internal_format = False
 
+ACLNN_MAX_TENSOR_LIST_SIZE = 256
+
 CASES = {
     "ref": {
         "shape": (128, 256),
@@ -42,7 +44,7 @@ CASES = {
         "shape": (64, 10000),
         "dtype": torch.int8,
         "dim": -1,
-        "max_step": 32,
+        "max_step": 64,
         "split_alignment": 1,
     },
 }
@@ -57,9 +59,17 @@ def generate_splits(total: int, max_step: int, alignment: int) -> list[int]:
     rng = random.Random(111)
     remaining_units = total // alignment
     max_units = max(1, max_step // alignment)
+    if remaining_units > ACLNN_MAX_TENSOR_LIST_SIZE * max_units:
+        raise ValueError(
+            f"cannot split {total} elements into at most {ACLNN_MAX_TENSOR_LIST_SIZE} "
+            f"parts with max_step={max_step} and alignment={alignment}"
+        )
+
     split_units = []
     while remaining_units > 0:
-        picked = rng.randint(0, min(remaining_units, max_units))
+        remaining_slots = ACLNN_MAX_TENSOR_LIST_SIZE - len(split_units)
+        min_pick = max(0, remaining_units - max_units * (remaining_slots - 1))
+        picked = rng.randint(min_pick, min(remaining_units, max_units))
         split_units.append(picked)
         remaining_units -= picked
     return [units * alignment for units in split_units]
@@ -82,6 +92,10 @@ def run_case(case_name: str) -> None:
     splits = generate_splits(
         source.shape[normalized_dim], case["max_step"], case["split_alignment"]
     )
+    if len(splits) > ACLNN_MAX_TENSOR_LIST_SIZE:
+        raise AssertionError(
+            f"generated {len(splits)} inputs, ACLNN limit is {ACLNN_MAX_TENSOR_LIST_SIZE}"
+        )
     cpu_inputs = list(torch.split(source, splits, dim=case["dim"]))
     npu_inputs = [tensor.npu() for tensor in cpu_inputs]
 

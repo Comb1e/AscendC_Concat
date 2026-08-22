@@ -35,7 +35,9 @@ CONCAT_TECHNICAL_DOCUMENT.md
 可通过 `$ascendc-operator-tuning` 调用，用于后续 Ascend C 算子开发、审查、DMA/UB 调优和 NPU 性能试验设计。
 本轮已补充两条可复用经验：L2 策略应按输入/输出的生命周期分别实验；性能复现除了 shape，
 还必须匹配输入复用、逐轮输出分配、分配器复用及中间算子造成的缓存行为。更新后的 skill
-已通过 `skill-creator` 的 `quick_validate.py` 校验。
+还记录了算子规格与 ACLNN 等调用前端的动态列表上限需要分开确认，以及“0 target tasks”
+通常是启动前错误的连带结果。更新后的 skill 已通过 `skill-creator` 的
+`quick_validate.py` 校验。
 
 ## Kernel 地址模型
 
@@ -224,7 +226,7 @@ bash build.sh
 | `row_unaligned` | 多 outer 行、非 32B 对齐片段和多行 `DataCopyPad` |
 | `row_aligned` | 多 outer 行、32B 对齐片段及 UB 内融合写回路径 |
 | `chunk_aligned` | `outerSize=1` 的大对齐片段、多核 chunk 调度 |
-| `many_inputs` | 约数百个小片段，放大动态 TensorList 元数据开销 |
+| `many_inputs` | ACLNN 上限 256 个小片段，放大动态 TensorList 元数据开销 |
 
 测试工具所需的 ACLNN/PyTorch NPU helper 已复制到
 `local_test/common/pytorch_npu_helper.hpp`，运行时不依赖 `test-ref/`，整个
@@ -275,6 +277,24 @@ CONCAT_OPAPI_LIB=/absolute/path/to/libcust_opapi.so bash local_test/run.sh all -
 
 脚本缺少 `nm` 时会在采集前退出。ACLNN 调用失败后 profiler 中出现“0 Concat tasks”是
 连带现象，不是另一个 Kernel 性能问题。
+
+`many_inputs` 最初使用 `max_step=32` 拆分长度 10000 的末轴，在固定随机种子下生成了
+613 个输入，超过当前 ACLNN 动态输入列表的 256 上限。调用因此在参数校验阶段失败，Kernel
+和 Tiling 均未执行，随后 profiler 报告“0 Concat tasks”也是连带现象。修复后保持
+`[64, 10000]`、INT8 和末轴拼接不变，将 `max_step` 调整为 64，并让拆分器根据剩余槽位
+动态限制随机下界，保证任何 case 都不会生成超过 256 个输入。当前固定种子下
+`many_inputs` 恰好生成 256 个输入，其中包含 5 个零长度分片，仍覆盖列表上限、非对齐片段
+和零长度输入。
+
+本次只修改 Python case 生成逻辑，不需要重建测试扩展，可直接重跑：
+
+```bash
+bash local_test/run.sh many_inputs
+```
+
+本次失败前 `chunk_aligned` 已完成本地测试，结果为 `median=17.920 us`、
+`min=16.160 us`、`max=19.480 us`。这是当前本地诊断 case 的单次结果，没有旧版本的同环境
+对照，不能直接推导官方隐藏 Case 的收益。
 
 每个 Case 成功时输出两行便于直接回传：
 
