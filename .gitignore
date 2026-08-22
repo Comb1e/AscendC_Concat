@@ -3,3 +3,4 @@ local_test/build/
 local_test/dist/
 local_test/*.egg-info/
 local_test/profiles/
+local_test/results/

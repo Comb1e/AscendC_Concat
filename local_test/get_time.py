@@ -40,6 +40,7 @@ def main() -> None:
     print(
         f"PERF_RESULT name={case_name} samples={len(measured)} "
         f"median_us={statistics.median(measured):.3f} "
+        f"mean_us={statistics.fmean(measured):.3f} "
         f"min_us={min(measured):.3f} max_us={max(measured):.3f}"
     )
 

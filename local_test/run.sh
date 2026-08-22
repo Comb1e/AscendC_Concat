@@ -5,7 +5,13 @@ SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 CASE_NAME=${1:-all}
 BUILD_MODE=${2:-}
 PROFILE_ROOT="$SCRIPT_DIR/profiles"
+RESULT_ROOT="$SCRIPT_DIR/results"
+REPO_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
+CODE_COMMIT=${CONCAT_CODE_COMMIT:-$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)}
+RESULT_DIR="$RESULT_ROOT/$CODE_COMMIT"
 CASES=(ref row_unaligned row_aligned chunk_aligned fused_tiles many_inputs single_input zero_segments preload_16 preload_17 max_inputs rank4_axis0 tile_tail)
+
+mkdir -p "$RESULT_DIR"
 
 if [ -z "${ASCEND_OPP_PATH:-}" ]; then
     echo "ASCEND_OPP_PATH is not set" >&2
@@ -101,13 +107,28 @@ profile_case()
         echo "$current_case profiling failed with status $profile_status" >&2
         return "$profile_status"
     fi
-    python3 "$SCRIPT_DIR/get_time.py" "$profile_dir" "$current_case"
+    local perf_result
+    perf_result=$(python3 "$SCRIPT_DIR/get_time.py" "$profile_dir" "$current_case")
+    echo "$perf_result"
+    {
+        echo "CASE_RESULT name=$current_case correctness=pass"
+        echo "$perf_result"
+    } > "$RESULT_DIR/$current_case.txt"
+}
+
+write_summary()
+{
+    python3 "$SCRIPT_DIR/summarize_results.py" \
+        "$RESULT_DIR" "$RESULT_DIR/summary.md" "$CODE_COMMIT" "${CASES[@]}"
+    cp "$RESULT_DIR/summary.md" "$RESULT_ROOT/latest.md"
+    echo "Latest local summary: $RESULT_ROOT/latest.md"
 }
 
 if [ "$CASE_NAME" = "all" ]; then
     for current_case in "${CASES[@]}"; do
         profile_case "$current_case"
     done
+    write_summary
 else
     valid=0
     for current_case in "${CASES[@]}"; do
@@ -122,4 +143,5 @@ else
         exit 2
     fi
     profile_case "$CASE_NAME"
+    write_summary
 fi
