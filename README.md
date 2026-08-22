@@ -99,7 +99,7 @@ Concat 不做数值计算，Kernel 使用 `uint8_t` 原始字节搬运统一覆�
 | `0e38813` | 显式回退 `9f07f4a` | 恢复 64/32 KiB tile 和双 Buffer 余量 | 保留 32 输入预加载及 mode 2 回退 |
 | `b702aec` | 保持 chunk 数不变，在每个输入片段内部均衡 chunk 字节数 | 避免略大于 tile 的片段产生大块与极小尾块、造成核间字节失衡 | chunk 路径每个多块片段增加均分计算 |
 | `d430bc0` | 单 chunk 和零长度片段跳过均分除法 | 避免不受益输入承担新增 Scalar 成本 | 多 chunk 路径保持 `b702aec` 行为 |
-| `6ad3bd3` | Host 按字节目标预计算每核连续 chunk 区间，Kernel 只遍历实际覆盖的输入 | 删除 chunk 模式下 `coreCount * inputCount` 的无效列表扫描 | Tiling 扩大到约 1416B；必须验证连续边界映射及大输入吞吐 |
+| `6ad3bd3` | Host 按字节目标预计算每核连续 chunk 区间，Kernel 只遍历实际覆盖的输入 | 删除 chunk 模式下 `coreCount * inputCount` 的无效列表扫描 | 本地长列表有效，但官方总耗时回退 2.74%，已判为不适合隐藏样例 |
 
 ### 首轮 NPU 反馈与原因分析
 
@@ -515,6 +515,55 @@ work item；每项均唯一归属一个核，零长度输入能正确跳过，�
 改变各核同时访问的输入顺序后影响缓存/带宽。若 `chunk_many_inputs` 和 `max_inputs` 明显改善、
 而 `chunk_single_large` 与 `chunk_aligned` 基本持平，才说明假设成立；若单输入大块也显著
 回退，应直接 revert `6ad3bd3`，不再把其他优化叠加到该版本。
+
+### `6ad3bd3` 后的官方结果与原因分析
+
+官方对 Host 连续 chunk 预分区的累计版本测得五项精度全部通过，但性能为：
+
+| Case | 上一轮/us | 当前/us | 差值/us | 变化率 |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 11.580 | 14.064 | +2.484 | +21.45% |
+| 2 | 35.332 | 43.756 | +8.424 | +23.84% |
+| 3 | 21.192 | 20.752 | -0.440 | -2.08% |
+| 4 | 107.220 | 108.980 | +1.760 | +1.64% |
+| 5 | 409.956 | 413.780 | +3.824 | +0.93% |
+| 合计 | 585.280 | 601.332 | +16.052 | +2.74% |
+
+Case1/2 的 `2.484/8.424 us` 回退远大于前几轮小 Case 的普通波动，不能继续把本轮判为中性。
+当前总耗时比历史最好 `573.612 us` 慢 `27.720 us`（`4.83%`），比满意线 `540 us` 高
+`61.332 us`。唯一改善的 Case3 下降 `0.440 us`，不足以抵消其余四项回退。
+
+本地 `localtest.md` 中标记为 `bb86f5e` 的 17 项结果则证明了预分区机制本身确实生效。与
+`39282b7` 的 15 个共同 Case 相比，中位数合计从 `344.087 us` 降到 `264.434 us`，减少
+`79.653 us`（`23.15%`）；均值合计从 `341.434 us` 降到 `266.804 us`，减少
+`74.630 us`（`21.86%`）。其中 `max_inputs` 从 `64.772` 降到 `27.490 us`，两个刻意构造的
+长片段 Case `chunk_imbalanced_aligned/unaligned` 分别从 `26.600/26.851` 降到
+`9.460/9.350 us`，`many_inputs` 也从 `86.672` 降到 `82.342 us`。新增的同字节数对照中，
+`chunk_many_inputs=15.131 us`，`chunk_single_large=16.870 us`，长列表已不再比单输入更慢。
+
+本地与官方方向相反并不矛盾。本地改善主要集中在 256 输入、40 核都会扫描完整列表的专门
+诊断形状；官方隐藏 Case 并不保证具有该分布。新版本还把固定 Tiling 从约 `296B` 扩大到
+约 `1416B`，并增加 chunk 起点恢复、连续区间和按字节边界逻辑。即使 row 地址公式没有改变，
+更大的 Kernel 参数与代码布局也可能增加固定开销；chunk 隐藏形状还可能因连续输入分组改变
+并发访存和核间尾部负载。缺少逐 Case tiling key 和流水线计数时不能把 Case2 回退严格归因于
+其中一项，但官方总表已经足以否定把这套大数组调度作为通用默认路径。
+
+下一轮回到 `2c97dca` 的最优原则：只在小型 Tiling 中预计算高复用元数据，并尽量用一次
+`blockCount/stride` DMA 表达规则搬运。将显式撤销 Host 预分区和未显示净收益的 chunk 均衡，
+同时把预加载上限恢复为官方最优版本的 16。新的高风险方向不再微调 chunk，而是针对缺失的
+“非对齐小片段整行融合”：先把多输入行搬入 UB 的对齐 staging 区，通过 910B 支持的 Gather
+压紧为连续输出，再用一次 MTE3 写回。该路径只覆盖 2B/4B 元素、输入数不超过 16 且整行较小
+的 row 调度，INT8 和不满足 UB 预算的形状继续使用旧路径。
+
+这一选择来自本机 CANN 8.5 内置 Concat 的专用路径划分与昇腾官方搬运建议。内置实现对
+全对齐、非对齐同形状和非对齐异形状分别处理；官方文档建议用
+`blockCount/blockLen/srcStride/dstStride` 合并规则搬运。更新架构的
+`PaddingMode::Compact` 不适用于 910B，因此本项目使用 910B 已提供的 Gather，而不直接照搬
+新架构 MicroAPI：
+
+- [Ascend C 高效使用搬运 API](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/80RC2alpha002/devguide/opdevg/ascendcbestP/atlas_ascendc_best_practices_10_0015.html)
+- [DataCopyPad 参数与非对齐 dummy 规则](https://www.hiascend.com/document/detail/zh/canncommercial/81RC1/apiref/ascendcopapi/atlasascendc_api_07_0265.html)
+- [Compact 模式的产品限制](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/900beta2/opdevg/Ascendcopdevg/atlas_ascendc_best_practices_10_00017.html)
 
 ### 下一轮实验：复用 Host 预加载的片段字节数
 
