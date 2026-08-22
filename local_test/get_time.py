@@ -32,7 +32,8 @@ def main() -> None:
     required = WARMUP_ROUNDS + MEASURED_ROUNDS
     if len(durations) < required:
         raise RuntimeError(
-            f"found {len(durations)} Concat tasks under {profile_dir}, expected at least {required}"
+            f"found {len(durations)} Concat tasks under {profile_dir}, expected at least {required}; "
+            "check the preceding application log for an ACLNN load or execution failure"
         )
 
     measured = durations[WARMUP_ROUNDS:required]

@@ -206,6 +206,27 @@ bash local_test/run.sh ref
 `torch_npu` 头文件产生的 unused warning 也不是本次失败原因。只要最终不出现
 `error:` 且 wheel 能成功生成和安装，这些 warning 可忽略。
 
+测试扩展成功导入后，曾在执行阶段出现
+`aclnnConcat or aclnnConcatGetWorkspaceSize not in libopapi.so`。helper 实际会先查找
+`libcust_opapi.so`，旧错误文本只显示系统 `libopapi.so`，无法区分算子包未安装、安装到
+其他自定义 OPP 根目录或加载到同名旧库。`run.sh` 现在会在 profiler 启动前完成以下检查：
+
+- 扫描 `ASCEND_OPP_PATH` 和冒号分隔的 `ASCEND_CUSTOM_OPP_PATH`；
+- 使用 `nm` 确认同一份 `libcust_opapi.so` 同时导出 `aclnnConcat` 和
+  `aclnnConcatGetWorkspaceSize`；
+- 通过 `CONCAT_OPAPI_LIB` 将已验证库的绝对路径传给 C++ helper，并把所在目录加入
+  `LD_LIBRARY_PATH`。
+
+若扫描失败，先执行 `bash build.sh` 并安装 `build_out/custom_*.run`，再检查上述 OPP
+环境变量。也可以显式指定已安装库后运行：
+
+```bash
+CONCAT_OPAPI_LIB=/absolute/path/to/libcust_opapi.so bash local_test/run.sh all --build
+```
+
+脚本缺少 `nm` 时会在采集前退出。ACLNN 调用失败后 profiler 中出现“0 Concat tasks”是
+连带现象，不是另一个 Kernel 性能问题。
+
 每个 Case 成功时输出两行便于直接回传：
 
 ```text

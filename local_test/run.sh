@@ -11,7 +11,64 @@ if [ -z "${ASCEND_OPP_PATH:-}" ]; then
     echo "ASCEND_OPP_PATH is not set" >&2
     exit 1
 fi
-export LD_LIBRARY_PATH="$ASCEND_OPP_PATH/vendors/customize/op_api/lib:${LD_LIBRARY_PATH:-}"
+
+has_concat_symbols()
+{
+    nm -D --defined-only "$1" 2>/dev/null | awk '
+        $NF ~ /^aclnnConcat(@@.*)?$/ { concat = 1 }
+        $NF ~ /^aclnnConcatGetWorkspaceSize(@@.*)?$/ { workspace = 1 }
+        END { exit !(concat && workspace) }
+    '
+}
+
+find_concat_opapi()
+{
+    local search_root
+    local candidate
+    local -a search_roots=("$ASCEND_OPP_PATH")
+    if [ -n "${ASCEND_CUSTOM_OPP_PATH:-}" ]; then
+        local -a custom_roots
+        local old_ifs=$IFS
+        IFS=:
+        read -ra custom_roots <<< "$ASCEND_CUSTOM_OPP_PATH"
+        IFS=$old_ifs
+        search_roots+=("${custom_roots[@]}")
+    fi
+
+    for search_root in "${search_roots[@]}"; do
+        if [ ! -d "$search_root" ]; then
+            continue
+        fi
+        while IFS= read -r candidate; do
+            if has_concat_symbols "$candidate"; then
+                echo "$candidate"
+                return 0
+            fi
+        done < <(find "$search_root" -maxdepth 6 -name libcust_opapi.so -print 2>/dev/null)
+    done
+    return 1
+}
+
+if ! command -v nm >/dev/null 2>&1; then
+    echo "nm is required to validate the installed custom op-api library" >&2
+    exit 1
+fi
+
+if [ -n "${CONCAT_OPAPI_LIB:-}" ]; then
+    if [ ! -f "$CONCAT_OPAPI_LIB" ] || ! has_concat_symbols "$CONCAT_OPAPI_LIB"; then
+        echo "CONCAT_OPAPI_LIB does not export aclnnConcat and aclnnConcatGetWorkspaceSize: $CONCAT_OPAPI_LIB" >&2
+        exit 1
+    fi
+else
+    if ! CONCAT_OPAPI_LIB=$(find_concat_opapi); then
+        echo "No installed libcust_opapi.so exporting aclnnConcat was found." >&2
+        echo "Build and install build_out/custom_*.run, then check ASCEND_OPP_PATH or ASCEND_CUSTOM_OPP_PATH." >&2
+        exit 1
+    fi
+fi
+export CONCAT_OPAPI_LIB
+export LD_LIBRARY_PATH="$(dirname "$CONCAT_OPAPI_LIB"):${LD_LIBRARY_PATH:-}"
+echo "Using custom op-api library: $CONCAT_OPAPI_LIB"
 
 if [ "$BUILD_MODE" = "--build" ]; then
     (

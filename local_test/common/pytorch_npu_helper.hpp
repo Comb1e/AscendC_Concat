@@ -27,6 +27,7 @@
 #include <torch_npu/csrc/framework/utils/CalcuOpUtil.h>
 #include <torch_npu/csrc/framework/utils/OpAdapter.h>
 
+#include <cstdlib>
 #include <functional>
 #include <type_traits>
 #include <vector>
@@ -118,7 +119,11 @@ constexpr aclDataType kATenScalarTypeToAclDataTypeTable
 
 inline const char *GetOpApiLibName(void) { return "libopapi.so"; }
 
-inline const char *GetCustOpApiLibName(void) { return "libcust_opapi.so"; }
+inline const char *GetCustOpApiLibName(void) {
+  const char *customLib = std::getenv("CONCAT_OPAPI_LIB");
+  return customLib != nullptr && customLib[0] != '\0' ? customLib
+                                                       : "libcust_opapi.so";
+}
 
 inline void *GetOpApiFuncAddrInLib(void *handler, const char *libName,
                                    const char *apiName) {
@@ -525,8 +530,9 @@ typedef void (*ReleaseHugeMem)(void *, bool);
     static const auto releaseMemAddr = GetOpApiFuncAddr("ReleaseHugeMem");    \
     TORCH_CHECK(                                                              \
         getWorkspaceSizeFuncAddr != nullptr && opApiFuncAddr != nullptr,      \
-        #aclnn_api, " or ", #aclnn_api "GetWorkspaceSize", " not in ",        \
-        GetOpApiLibName(), ", or ", GetOpApiLibName(), "not found.");         \
+        #aclnn_api, " or ", #aclnn_api "GetWorkspaceSize",                   \
+        " not found; checked custom library ", GetCustOpApiLibName(),         \
+        " and system library ", GetOpApiLibName(), ".");                     \
     auto acl_stream = c10_npu::getCurrentNPUStream().stream(false);           \
     uint64_t workspace_size = 0;                                              \
     uint64_t *workspace_size_addr = &workspace_size;                          \
