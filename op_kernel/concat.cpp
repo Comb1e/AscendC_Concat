@@ -6,6 +6,7 @@ using namespace AscendC;
 namespace {
 constexpr uint32_t kBufferCount = 2;
 constexpr uint32_t kMaxRank = 8;
+constexpr uint32_t kPreloadedSegmentCount = 16;
 constexpr uint32_t kDataBlockBytes = 32;
 constexpr uint64_t kMaxCopyStride = 0xFFFFFFFFULL;
 constexpr uint64_t kMaxCopyRows = 4095ULL;
@@ -114,6 +115,47 @@ __aicore__ inline void ProcessByRows(ListTensorDesc& inputs, GlobalTensor<uint8_
 }
 
 template <typename Queue>
+__aicore__ inline void ProcessFusedAlignedRows(ListTensorDesc& inputs, GlobalTensor<uint8_t>& output,
+                                              const ConcatTilingData& tilingData, Queue& queue)
+{
+    const uint32_t blockIdx = GetBlockIdx();
+    const uint32_t blockCount = GetBlockNum();
+    const uint64_t rowsPerCore = tilingData.outerSize / blockCount;
+    const uint64_t extraRows = tilingData.outerSize % blockCount;
+    const uint64_t coreRows = rowsPerCore + (blockIdx < extraRows ? 1 : 0);
+    const uint64_t firstOuter = blockIdx * rowsPerCore + MinU64(blockIdx, extraRows);
+    const uint64_t rowsPerBatch = tilingData.tileBytes / tilingData.outputRowBytes;
+
+    uint64_t row = 0;
+    while (row < coreRows) {
+        const uint16_t batchRows = static_cast<uint16_t>(MinU64(rowsPerBatch, coreRows - row));
+        LocalTensor<uint8_t> local = queue.template AllocTensor<uint8_t>();
+        uint64_t outputInputOffset = 0;
+        for (uint32_t inputIdx = 0; inputIdx < tilingData.inputCount; ++inputIdx) {
+            const uint64_t segmentBytes = tilingData.segmentBytes[inputIdx];
+            if (segmentBytes != 0) {
+                GlobalTensor<uint8_t> source;
+                source.SetGlobalBuffer(inputs.GetDataPtr<uint8_t>(inputIdx));
+                DataCopyParams copyInParams{
+                    batchRows, static_cast<uint16_t>(segmentBytes / kDataBlockBytes), 0,
+                    static_cast<uint16_t>((tilingData.outputRowBytes - segmentBytes) / kDataBlockBytes)};
+                DataCopy(local[outputInputOffset], source[(firstOuter + row) * segmentBytes], copyInParams);
+            }
+            outputInputOffset += segmentBytes;
+        }
+
+        queue.template EnQue<QuePosition::VECIN, QuePosition::VECOUT, uint8_t>(local);
+        local = queue.template DeQue<QuePosition::VECIN, QuePosition::VECOUT, uint8_t>();
+        const uint32_t batchBytes = static_cast<uint32_t>(batchRows * tilingData.outputRowBytes);
+        DataCopyParams copyOutParams{
+            1, static_cast<uint16_t>(batchBytes / kDataBlockBytes), 0, 0};
+        DataCopy(output[(firstOuter + row) * tilingData.outputRowBytes], local, copyOutParams);
+        queue.FreeTensor(local);
+        row += batchRows;
+    }
+}
+
+template <typename Queue>
 __aicore__ inline void ProcessByChunks(ListTensorDesc& inputs, GlobalTensor<uint8_t>& output,
                                       const ConcatTilingData& tilingData, Queue& queue)
 {
@@ -171,7 +213,13 @@ extern "C" __global__ __aicore__ void concat(
     TQueBind<QuePosition::VECIN, QuePosition::VECOUT, kBufferCount> queue;
     pipe.InitBuffer(queue, kBufferCount, tilingData.tileBytes);
 
-    if (tilingData.scheduleMode == 0) {
+    const bool fuseAlignedRows = tilingData.scheduleMode == 0 && tilingData.allSegmentsAligned != 0 &&
+                                 tilingData.inputCount <= kPreloadedSegmentCount &&
+                                 tilingData.outputRowBytes != 0 &&
+                                 tilingData.outputRowBytes <= tilingData.tileBytes;
+    if (fuseAlignedRows) {
+        ProcessFusedAlignedRows(inputList, outputTensor, tilingData, queue);
+    } else if (tilingData.scheduleMode == 0) {
         ProcessByRows(inputList, outputTensor, tilingData, queue);
     } else {
         ProcessByChunks(inputList, outputTensor, tilingData, queue);
