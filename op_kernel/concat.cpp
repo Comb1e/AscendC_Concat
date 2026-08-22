@@ -212,6 +212,91 @@ __aicore__ inline void ProcessByChunks(ListTensorDesc& inputs, GlobalTensor<uint
         outputInputOffset += segmentBytes;
     }
 }
+
+template <typename Queue>
+__aicore__ inline void ProcessFusedAlignedTiles(ListTensorDesc& inputs, GlobalTensor<uint8_t>& output,
+                                               const ConcatTilingData& tilingData, Queue& queue)
+{
+    __gm__ uint8_t* sourcePointers[kPreloadedSegmentCount];
+    for (uint32_t inputIdx = 0; inputIdx < tilingData.inputCount; ++inputIdx) {
+        if (tilingData.segmentBytes[inputIdx] != 0) {
+            sourcePointers[inputIdx] = inputs.GetDataPtr<uint8_t>(inputIdx);
+        }
+    }
+
+    const uint64_t chunksPerOuter =
+        (tilingData.outputRowBytes + tilingData.tileBytes - 1) / tilingData.tileBytes;
+    const uint64_t workItems = tilingData.outerSize * chunksPerOuter;
+    const uint32_t blockIdx = GetBlockIdx();
+    const uint32_t blockCount = GetBlockNum();
+    const uint64_t baseItems = workItems / blockCount;
+    const uint64_t extraItems = workItems % blockCount;
+    const uint64_t coreItems = baseItems + (blockIdx < extraItems ? 1 : 0);
+    const uint64_t firstWorkItem = blockIdx * baseItems + MinU64(blockIdx, extraItems);
+
+    // Assign contiguous tiles to each core so the input-boundary walk advances
+    // monotonically rather than restarting at input zero for every tile.
+    uint64_t previousOuter = static_cast<uint64_t>(-1);
+    uint32_t inputIdx = 0;
+    uint64_t inputStart = 0;
+    for (uint64_t localWorkItem = 0; localWorkItem < coreItems; ++localWorkItem) {
+        const uint64_t workItem = firstWorkItem + localWorkItem;
+        const uint64_t outer = workItem / chunksPerOuter;
+        const uint64_t chunk = workItem - outer * chunksPerOuter;
+        const uint64_t tileStart = chunk * tilingData.tileBytes;
+        const uint32_t tileBytes = static_cast<uint32_t>(
+            MinU64(tilingData.tileBytes, tilingData.outputRowBytes - tileStart));
+        const uint64_t tileEnd = tileStart + tileBytes;
+
+        if (outer != previousOuter) {
+            previousOuter = outer;
+            inputIdx = 0;
+            inputStart = 0;
+        }
+        while (inputIdx < tilingData.inputCount &&
+               inputStart + tilingData.segmentBytes[inputIdx] <= tileStart) {
+            inputStart += tilingData.segmentBytes[inputIdx];
+            ++inputIdx;
+        }
+
+        LocalTensor<uint8_t> local = queue.template AllocTensor<uint8_t>();
+        uint32_t currentInput = inputIdx;
+        uint64_t currentStart = inputStart;
+        while (currentInput < tilingData.inputCount && currentStart < tileEnd) {
+            const uint64_t segmentBytes = tilingData.segmentBytes[currentInput];
+            const uint64_t inputEnd = currentStart + segmentBytes;
+            const uint64_t copyStart = tileStart > currentStart ? tileStart : currentStart;
+            const uint64_t copyEnd = MinU64(tileEnd, inputEnd);
+            if (copyStart < copyEnd) {
+                const uint32_t copyBytes = static_cast<uint32_t>(copyEnd - copyStart);
+                GlobalTensor<uint8_t> source;
+                source.SetGlobalBuffer(sourcePointers[currentInput]);
+                DataCopyParams copyInParams{
+                    1, static_cast<uint16_t>(copyBytes / kDataBlockBytes), 0, 0};
+                DataCopy(local[copyStart - tileStart],
+                         source[outer * segmentBytes + copyStart - currentStart], copyInParams);
+            }
+            if (inputEnd <= tileEnd) {
+                currentStart = inputEnd;
+                ++currentInput;
+            } else {
+                // Keep a segment that continues into the next tile as the
+                // next starting point; only its source offset advances there.
+                break;
+            }
+        }
+
+        queue.template EnQue<QuePosition::VECIN, QuePosition::VECOUT, uint8_t>(local);
+        local = queue.template DeQue<QuePosition::VECIN, QuePosition::VECOUT, uint8_t>();
+        DataCopyParams copyOutParams{
+            1, static_cast<uint16_t>(tileBytes / kDataBlockBytes), 0, 0};
+        DataCopy(output[outer * tilingData.outputRowBytes + tileStart], local, copyOutParams);
+        queue.FreeTensor(local);
+
+        inputIdx = currentInput;
+        inputStart = currentStart;
+    }
+}
 }  // namespace
 
 extern "C" __global__ __aicore__ void concat(
@@ -233,7 +318,9 @@ extern "C" __global__ __aicore__ void concat(
                                  tilingData.inputCount <= kPreloadedSegmentCount &&
                                  tilingData.outputRowBytes != 0 &&
                                  tilingData.outputRowBytes <= tilingData.tileBytes;
-    if (fuseAlignedRows) {
+    if (tilingData.scheduleMode == 2) {
+        ProcessFusedAlignedTiles(inputList, outputTensor, tilingData, queue);
+    } else if (fuseAlignedRows) {
         ProcessFusedAlignedRows(inputList, outputTensor, tilingData, queue);
     } else if (tilingData.scheduleMode == 0) {
         ProcessByRows(inputList, outputTensor, tilingData, queue);
