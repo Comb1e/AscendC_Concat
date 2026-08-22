@@ -17,11 +17,6 @@ __aicore__ inline uint64_t MinU64(uint64_t lhs, uint64_t rhs)
     return lhs < rhs ? lhs : rhs;
 }
 
-__aicore__ inline uint64_t AlignUpU64(uint64_t value, uint64_t alignment)
-{
-    return (value + alignment - 1) / alignment * alignment;
-}
-
 __aicore__ inline uint64_t LoadInput(ListTensorDesc& inputs, uint32_t inputIdx,
                                     const ConcatTilingData& tilingData,
                                     GlobalTensor<uint8_t>& source)
@@ -186,113 +181,6 @@ __aicore__ inline void ProcessFusedAlignedRows(ListTensorDesc& inputs, GlobalTen
     }
 }
 
-__aicore__ inline void ProcessFusedUnalignedRows(ListTensorDesc& inputs,
-                                                 GlobalTensor<uint8_t>& output,
-                                                 const ConcatTilingData& tilingData,
-                                                 TPipe& pipe)
-{
-    const uint32_t blockIdx = GetBlockIdx();
-    const uint32_t blockCount = GetBlockNum();
-    const uint64_t rowsPerCore = tilingData.outerSize / blockCount;
-    const uint64_t extraRows = tilingData.outerSize % blockCount;
-    const uint64_t coreRows = rowsPerCore + (blockIdx < extraRows ? 1 : 0);
-    const uint64_t firstOuter = blockIdx * rowsPerCore + MinU64(blockIdx, extraRows);
-    const uint32_t outputElements =
-        static_cast<uint32_t>(tilingData.outputRowBytes / tilingData.elementBytes);
-    const uint32_t offsetBufferBytes = static_cast<uint32_t>(
-        AlignUpU64(static_cast<uint64_t>(outputElements) * sizeof(uint32_t), kDataBlockBytes));
-    const uint32_t stagingBufferBytes = tilingData.compactBatchRows * tilingData.stagingRowBytes;
-    const uint32_t outputBufferBytes = tilingData.compactBatchRows * tilingData.alignedOutputRowBytes;
-
-    TQue<QuePosition::VECIN, 1> stagingQueue;
-    TQue<QuePosition::VECOUT, 1> outputQueue;
-    TBuf<QuePosition::VECCALC> offsetBuffer;
-    pipe.InitBuffer(stagingQueue, 1, stagingBufferBytes);
-    pipe.InitBuffer(outputQueue, 1, outputBufferBytes);
-    pipe.InitBuffer(offsetBuffer, offsetBufferBytes);
-
-    LocalTensor<int32_t> offsetsInt = offsetBuffer.Get<int32_t>();
-    uint32_t outputElementOffset = 0;
-    uint32_t stagingInputOffset = 0;
-    for (uint32_t inputIdx = 0; inputIdx < tilingData.inputCount; ++inputIdx) {
-        const uint32_t segmentBytes = static_cast<uint32_t>(tilingData.segmentBytes[inputIdx]);
-        const uint32_t segmentElements = segmentBytes / tilingData.elementBytes;
-        if (segmentElements != 0) {
-            ArithProgression(offsetsInt[outputElementOffset], static_cast<int32_t>(stagingInputOffset),
-                             static_cast<int32_t>(tilingData.elementBytes),
-                             static_cast<int32_t>(segmentElements));
-        }
-        outputElementOffset += segmentElements;
-        stagingInputOffset += static_cast<uint32_t>(AlignUpU64(segmentBytes, kDataBlockBytes));
-    }
-    PipeBarrier<PIPE_V>();
-    LocalTensor<uint32_t> offsets = offsetsInt.ReinterpretCast<uint32_t>();
-
-    __gm__ uint8_t* sourcePointers[kPreloadedSegmentCount];
-    for (uint32_t inputIdx = 0; inputIdx < tilingData.inputCount; ++inputIdx) {
-        if (tilingData.segmentBytes[inputIdx] != 0) {
-            sourcePointers[inputIdx] = inputs.GetDataPtr<uint8_t>(inputIdx);
-        }
-    }
-
-    uint64_t row = 0;
-    while (row < coreRows) {
-        const uint16_t batchRows = static_cast<uint16_t>(
-            MinU64(tilingData.compactBatchRows, coreRows - row));
-        LocalTensor<uint8_t> staging = stagingQueue.AllocTensor<uint8_t>();
-        uint32_t stagingOffset = 0;
-        for (uint32_t inputIdx = 0; inputIdx < tilingData.inputCount; ++inputIdx) {
-            const uint32_t segmentBytes = static_cast<uint32_t>(tilingData.segmentBytes[inputIdx]);
-            if (segmentBytes != 0) {
-                GlobalTensor<uint8_t> source;
-                source.SetGlobalBuffer(sourcePointers[inputIdx]);
-                const uint32_t alignedSegmentBytes = static_cast<uint32_t>(
-                    AlignUpU64(segmentBytes, kDataBlockBytes));
-                DataCopyExtParams copyInParams{
-                    batchRows, segmentBytes, 0,
-                    (tilingData.stagingRowBytes - alignedSegmentBytes) / kDataBlockBytes, 0};
-                DataCopyPadExtParams<uint8_t> padParams{false, 0, 0, 0};
-                DataCopyPad(staging[stagingOffset],
-                            source[(firstOuter + row) * segmentBytes], copyInParams, padParams);
-                stagingOffset += alignedSegmentBytes;
-            }
-        }
-        stagingQueue.EnQue<uint8_t>(staging);
-        staging = stagingQueue.DeQue<uint8_t>();
-
-        LocalTensor<uint8_t> compact = outputQueue.AllocTensor<uint8_t>();
-        if (tilingData.elementBytes == sizeof(uint16_t)) {
-            LocalTensor<uint16_t> stagingElements = staging.ReinterpretCast<uint16_t>();
-            LocalTensor<uint16_t> outputElementsLocal = compact.ReinterpretCast<uint16_t>();
-            for (uint32_t batchRow = 0; batchRow < batchRows; ++batchRow) {
-                Gather(outputElementsLocal[
-                           batchRow * tilingData.alignedOutputRowBytes / sizeof(uint16_t)],
-                       stagingElements, offsets, batchRow * tilingData.stagingRowBytes,
-                       outputElements);
-            }
-        } else {
-            LocalTensor<uint32_t> stagingElements = staging.ReinterpretCast<uint32_t>();
-            LocalTensor<uint32_t> outputElementsLocal = compact.ReinterpretCast<uint32_t>();
-            for (uint32_t batchRow = 0; batchRow < batchRows; ++batchRow) {
-                Gather(outputElementsLocal[
-                           batchRow * tilingData.alignedOutputRowBytes / sizeof(uint32_t)],
-                       stagingElements, offsets, batchRow * tilingData.stagingRowBytes,
-                       outputElements);
-            }
-        }
-        outputQueue.EnQue<uint8_t>(compact);
-        stagingQueue.FreeTensor(staging);
-
-        compact = outputQueue.DeQue<uint8_t>();
-        DataCopyExtParams copyOutParams{
-            batchRows, static_cast<uint32_t>(tilingData.outputRowBytes), 0, 0, 0};
-        DataCopyPad(output[(firstOuter + row) * tilingData.outputRowBytes], compact,
-                    copyOutParams);
-        outputQueue.FreeTensor(compact);
-        row += batchRows;
-    }
-}
-
 template <typename Queue>
 __aicore__ inline void ProcessByChunks(ListTensorDesc& inputs, GlobalTensor<uint8_t>& output,
                                       const ConcatTilingData& tilingData, Queue& queue)
@@ -338,11 +226,6 @@ extern "C" __global__ __aicore__ void concat(
     outputTensor.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(output));
 
     TPipe pipe;
-    if (tilingData.scheduleMode == 2) {
-        ProcessFusedUnalignedRows(inputList, outputTensor, tilingData, pipe);
-        return;
-    }
-
     TQueBind<QuePosition::VECIN, QuePosition::VECOUT, kBufferCount> queue;
     pipe.InitBuffer(queue, kBufferCount, tilingData.tileBytes);
 
