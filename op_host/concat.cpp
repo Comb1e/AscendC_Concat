@@ -109,7 +109,21 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
     const uint64_t chunkCoreCount = std::min<uint64_t>(maxCoreCount, chunkWorkItems);
     // Keep the lower-overhead row path unless chunking activates more AIV cores.
     const bool rowSchedule = chunkCoreCount <= rowCoreCount;
-    const uint64_t workItems = rowSchedule ? rowWorkItems : chunkWorkItems;
+    uint32_t scheduleMode = rowSchedule ? 0U : 1U;
+    uint64_t workItems = rowSchedule ? rowWorkItems : chunkWorkItems;
+
+    // Assemble aligned output tiles only when coalescing MTE3 writes preserves active-core occupancy.
+    if (inputCount <= optiling::kPreloadedSegmentCount && allSegmentsAligned &&
+        outputRowBytes > tileBytes) {
+        const uint64_t fusedChunksPerOuter = (outputRowBytes + tileBytes - 1) / tileBytes;
+        const uint64_t fusedWorkItems = outerSize * fusedChunksPerOuter;
+        const uint64_t fusedCoreCount = std::min<uint64_t>(maxCoreCount, fusedWorkItems);
+        const uint64_t selectedCoreCount = rowSchedule ? rowCoreCount : chunkCoreCount;
+        if (fusedCoreCount >= selectedCoreCount) {
+            scheduleMode = 2U;
+            workItems = fusedWorkItems;
+        }
+    }
     const uint32_t blockDim = static_cast<uint32_t>(
         std::max<uint64_t>(1, std::min<uint64_t>(maxCoreCount, workItems)));
 
@@ -119,7 +133,7 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
     tiling.set_inputCount(static_cast<uint32_t>(inputCount));
     tiling.set_concatDim(concatDim);
     tiling.set_elementBytes(static_cast<uint32_t>(dtypeBytes));
-    tiling.set_scheduleMode(rowSchedule ? 0U : 1U);
+    tiling.set_scheduleMode(scheduleMode);
     tiling.set_tileBytes(tileBytes);
     tiling.set_allSegmentsAligned(allSegmentsAligned ? 1U : 0U);
     tiling.set_segmentBytes(preloadedSegmentBytes);

@@ -5,7 +5,7 @@ SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 CASE_NAME=${1:-all}
 BUILD_MODE=${2:-}
 PROFILE_ROOT="$SCRIPT_DIR/profiles"
-CASES=(ref row_unaligned row_aligned chunk_aligned many_inputs)
+CASES=(ref row_unaligned row_aligned chunk_aligned fused_tiles many_inputs)
 
 if [ -z "${ASCEND_OPP_PATH:-}" ]; then
     echo "ASCEND_OPP_PATH is not set" >&2

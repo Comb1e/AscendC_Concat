@@ -40,6 +40,12 @@ CASES = {
         "max_step": 512,
         "split_alignment": 1,
     },
+    "fused_tiles": {
+        "shape": (8, 524288),
+        "dtype": torch.int8,
+        "dim": -1,
+        "splits": [32768] * 16,
+    },
     "many_inputs": {
         "shape": (64, 10000),
         "dtype": torch.int8,
@@ -89,9 +95,14 @@ def run_case(case_name: str) -> None:
     case = CASES[case_name]
     source = make_input(case["shape"], case["dtype"])
     normalized_dim = case["dim"] % source.dim()
-    splits = generate_splits(
-        source.shape[normalized_dim], case["max_step"], case["split_alignment"]
-    )
+    if "splits" in case:
+        splits = case["splits"]
+        if sum(splits) != source.shape[normalized_dim] or any(split < 0 for split in splits):
+            raise AssertionError("fixed splits must be nonnegative and cover the concat dimension")
+    else:
+        splits = generate_splits(
+            source.shape[normalized_dim], case["max_step"], case["split_alignment"]
+        )
     if len(splits) > ACLNN_MAX_TENSOR_LIST_SIZE:
         raise AssertionError(
             f"generated {len(splits)} inputs, ACLNN limit is {ACLNN_MAX_TENSOR_LIST_SIZE}"

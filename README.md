@@ -81,7 +81,8 @@ Concat 不做数值计算，Kernel 使用 `uint8_t` 原始字节搬运统一覆�
 | `767c220` | 使用 `desc.GetDataPtr()` 复用 `GetDesc` 已解析的数据指针 | 每核、每输入减少一次 TensorList 指针 GM 读取 | 预期主要改善小数据或多输入的 Scalar 开销 |
 | `b041908` | 对齐行在 UB 内拼接多个输入后整批连续写回 | 将每批行的 MTE3 次数从输入数降为 1 | 仅用于行调度、最多 16 输入、整行不超过 tile 的全对齐场景 |
 | `b2ecea2` | 保留输入默认缓存，仅让输出绕过 L2 | 验证瞬时输出是否会挤占复用输入的缓存 | 官方测试总耗时回退 38.29%，已判负 |
-| 当前恢复提交 | 删除输出 L2 bypass，恢复 `b041908` 的默认缓存策略 | 消除所有 Case 的一致性回退 | 保留更贴近官方生命周期的测试封装 |
+| `b717f0a` | 删除输出 L2 bypass，恢复 `b041908` 的默认缓存策略 | 消除所有 Case 的一致性回退 | 保留更贴近官方生命周期的测试封装 |
+| 当前实验 | 对齐大行按输出 tile 在 UB 中组装后单次写回 | 合并跨输入边界的 MTE3，重点改善大搬运 Case | 仅在不减少活跃 AIV 数时启用 |
 
 ### 首轮 NPU 反馈与原因分析
 
@@ -199,6 +200,29 @@ DMA 或调度，只减少每核、每输入一次元数据 GM 访问。
 `b041908` 累计版本的输入、输出默认缓存策略。后续不再把缓存策略与其他 Kernel 改动叠加，
 `578.9805 us` 继续作为下一项独立优化的比较基线。
 
+### 下一轮实验：对齐大行按输出 tile 融合
+
+已有 `b041908` 仅在完整输出行不超过 32/64 KiB tile 时融合写回；若输出行更大，旧 row/chunk
+路径仍按输入片段分别执行 MTE3。当前实验为 `inputCount <= 16`、所有片段 32B 对齐且
+`outputRowBytes > tileBytes` 的场景增加 schedule mode 2：将每个输出行划分为连续输出 tile，
+计算 tile 与各输入前缀区间的交集，把这些交集直接搬到 UB 中的最终偏移，然后对整个 tile
+执行一次连续 MTE3 写回。
+
+第 `o` 行输出 tile `[t, t + n)` 与输入 `i` 的输出区间 `[p_i, p_i + s_i)` 的交集为
+`[max(t, p_i), min(t + n, p_i + s_i))`。交集对应的源偏移为
+`o * s_i + overlapStart - p_i`，UB 偏移为 `overlapStart - t`，因此输出地址模型不变；所有
+片段边界、tile 起点及尾 tile 长度均为 32B 整数倍，可以继续使用普通 `DataCopy`。
+
+Host 会比较新路径和原 row/chunk 路径的活跃核数，仅当融合 work items 激活不少于原方案的
+AIV 核数时设置 mode 2。这样减少跨输入边界的 MTE3 命令时不会以降低核占用为代价。新路径
+还把最多 16 个输入数据指针在每核开始时读取一次，避免每个 tile 重复访问 TensorList。
+非对齐、超过 16 输入、整行不超过 tile 或可能降低活跃核数的场景完全保留旧路径。
+
+该实验的潜在收益取决于隐藏 Case 的输入片段相对 tile 的分布：一个 tile 跨越的输入边界越多，
+省下的 MTE3 越多；若大部分输入片段本身远大于 tile，则多数 tile 只覆盖一个输入，收益可能
+接近零。下一次官方结果必须与默认缓存基线 `578.9805 us` 比较，不能与已判负的
+`800.657 us` 版本比较。
+
 ### 调优示例的取舍
 
 本轮使用了示例中适合纯搬运算子的原则：多核负载均衡、大包搬运、双 Buffer 队列、L2 策略和对齐/UB 规划。
@@ -230,7 +254,7 @@ bash build.sh
 `aclnnMul`，并在
 `op_summary*.csv` 中只收集名称包含 `Concat` 的任务。
 
-五个诊断 Case 分别覆盖：
+六个诊断 Case 分别覆盖：
 
 | 名称 | 主要用途 |
 | --- | --- |
@@ -238,6 +262,7 @@ bash build.sh
 | `row_unaligned` | 多 outer 行、非 32B 对齐片段和多行 `DataCopyPad` |
 | `row_aligned` | 多 outer 行、32B 对齐片段及 UB 内融合写回路径 |
 | `chunk_aligned` | `outerSize=1` 的大对齐片段、多核 chunk 调度 |
+| `fused_tiles` | 16 个 32 KiB 对齐片段组成 512 KiB 大行，直接覆盖 mode 2 跨输入 tile 融合 |
 | `many_inputs` | ACLNN 上限 256 个小片段，放大动态 TensorList 元数据开销 |
 
 测试工具所需的 ACLNN/PyTorch NPU helper 已复制到
@@ -308,6 +333,15 @@ bash local_test/run.sh many_inputs
 `min=16.160 us`、`max=19.480 us`。这是当前本地诊断 case 的单次结果，没有旧版本的同环境
 对照，不能直接推导官方隐藏 Case 的收益。
 
+新增 `fused_tiles` 固定使用 `[8, 524288]` INT8 输入和 16 个 32 KiB 片段。64 KiB tile
+每次恰好跨越两个输入边界；旧 chunk 路径每行产生 16 个输出 DMA，新 mode 2 每行产生 8 个，
+且两者在 910B 上都能激活 40 个 AIV。只修改测试 case 后不需要重建测试扩展，但需要先重新
+构建并安装当前算子包，然后可单独运行：
+
+```bash
+bash local_test/run.sh fused_tiles
+```
+
 每个 Case 成功时输出两行便于直接回传：
 
 ```text
@@ -323,7 +357,7 @@ PERF_RESULT name=<case> samples=20 median_us=<time> min_us=<time> max_us=<time>
 
 ```bash
 git log --oneline -12
-# 本轮缓存恢复后的算子代码应与 b041908 的缓存策略一致
+# 当前待测版本应包含 mode 2 对齐大行输出 tile 融合，并保持默认 L2 策略
 
 bash build.sh
 # 按比赛环境原有流程安装 custom_*.run，运行精度与五个性能样例
@@ -339,13 +373,12 @@ correctness: pass|fail
 times_us: <case1>, <case2>, <case3>, <case4>, <case5>
 ```
 
-本地测试优先回传 `row_aligned`、`many_inputs` 和 `ref`；其中 `row_aligned` 直接覆盖
-`b041908` 新路径，`many_inputs` 观察动态列表元数据开销，`ref` 对应已知 Case2 的
-`[128, 256]` FP16 非对齐随机分片。本轮修改了本地 C++ 测试封装，需要重新执行一次
-`bash local_test/run.sh all --build`。官方系统已证明 `b2ecea2` 的输出 L2 bypass 回退，
-下一次提交应以恢复默认缓存后的提交为基线。若下一项 Kernel 优化回退，直接与该恢复提交
-比较；若还需隔离更早改动，再测试 `767c220` 排除 UB 融合路径，最后用 `75eec09`
-复现 `589.168 us` 结果。
+本地测试优先回传 `fused_tiles`、`row_aligned`、`many_inputs` 和 `ref`；其中 `fused_tiles`
+直接覆盖当前 mode 2，`row_aligned` 覆盖 `b041908` 路径，`many_inputs` 观察动态列表元数据
+开销，`ref` 对应已知 Case2 的 `[128, 256]` FP16 非对齐随机分片。测试扩展已构建时无需因
+Python case 改动执行 `--build`。当前 mode 2 实验必须与默认缓存基线 `b717f0a` 的
+`578.9805 us` 比较。若性能回退，先回到 `b717f0a`；若还需隔离更早改动，再测试
+`767c220` 排除 UB 融合路径，最后用 `75eec09` 复现 `589.168 us` 结果。
 
 更早的累计版本顺序为：
 
