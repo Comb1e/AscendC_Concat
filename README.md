@@ -131,8 +131,9 @@ bash build.sh
 | `chunk_aligned` | `outerSize=1` 的大对齐片段、多核 chunk 调度 |
 | `many_inputs` | 约数百个小片段，放大动态 TensorList 元数据开销 |
 
-测试工具复用 `test-ref/common/pytorch_npu_helper.hpp`，因此运行时需保留用户提供的
-`test-ref/` 目录。先重新构建、安装当前算子包，再首次构建测试扩展并运行全部 Case：
+测试工具所需的 ACLNN/PyTorch NPU helper 已复制到
+`local_test/common/pytorch_npu_helper.hpp`，运行时不依赖 `test-ref/`，整个
+`local_test/` 目录可以独立迁移。先重新构建、安装当前算子包，再首次构建测试扩展并运行全部 Case：
 
 ```bash
 bash build.sh
@@ -147,6 +148,17 @@ bash local_test/run.sh all
 # 也可只跑一个分支，例如：
 bash local_test/run.sh ref
 ```
+
+### 测试扩展兼容性修复
+
+首次在用户的 PyTorch/Python 3.9 环境构建测试扩展时，本地 helper 的
+`EXEC_NPU_CMD` 宏使用了未限定命名空间的 `kByte`，而该版本 PyTorch 只公开
+`c10::kByte`，导致 C++ 编译失败。现已在 `local_test` 自带的 helper 中改为
+`c10::kByte`。此更改只修复测试扩展的源码兼容性，不修改算子实现或执行语义。
+
+构建日志中的 `ninja` 缺失提示只表示回退到较慢的 distutils 后端；
+`torch_npu` 头文件产生的 unused warning 也不是本次失败原因。只要最终不出现
+`error:` 且 wheel 能成功生成和安装，这些 warning 可忽略。
 
 每个 Case 成功时输出两行便于直接回传：
 

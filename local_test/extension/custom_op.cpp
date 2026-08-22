@@ -2,7 +2,7 @@
 
 #include <vector>
 
-#include "../../test-ref/common/pytorch_npu_helper.hpp"
+#include "../common/pytorch_npu_helper.hpp"
 
 namespace {
 constexpr int64_t kProfileRounds = 30;
