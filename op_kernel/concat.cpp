@@ -199,11 +199,10 @@ __aicore__ inline void ProcessByChunks(ListTensorDesc& inputs, GlobalTensor<uint
         GlobalTensor<uint8_t> source;
         const uint64_t segmentBytes = LoadInput(inputs, inputIdx, tilingData, source);
         const uint64_t chunkCount = CeilDivU64(segmentBytes, tilingData.tileBytes);
-        uint64_t balancedChunkBytes = segmentBytes;
-        if (chunkCount > 1) {
-            const uint64_t averageChunkBytes = CeilDivU64(segmentBytes, chunkCount);
-            balancedChunkBytes = CeilDivU64(averageChunkBytes, kDataBlockBytes) * kDataBlockBytes;
-        }
+        const uint64_t averageChunkBytes =
+            chunkCount == 0 ? 0 : CeilDivU64(segmentBytes, chunkCount);
+        const uint64_t balancedChunkBytes =
+            CeilDivU64(averageChunkBytes, kDataBlockBytes) * kDataBlockBytes;
         const uint64_t inputWorkItems = tilingData.outerSize * chunkCount;
         const uint64_t firstWorkItem =
             (blockIdx + blockCount - globalChunkBase % blockCount) % blockCount;
