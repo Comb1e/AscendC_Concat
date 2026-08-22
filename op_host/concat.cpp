@@ -9,7 +9,8 @@
 #include "tiling/platform/platform_ascendc.h"
 
 namespace {
-constexpr uint32_t kTileBytes = 32U * 1024U;
+constexpr uint32_t kSmallTileBytes = 32U * 1024U;
+constexpr uint32_t kLargeTileBytes = 64U * 1024U;
 constexpr uint32_t kFallbackVectorCores = 40U;
 
 bool NormalizeDim(int64_t rawDim, size_t rank, uint32_t& dim)
@@ -59,7 +60,8 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
     const uint64_t outerSize = Product(firstShape, 0, concatDim);
     const uint64_t innerSize = Product(firstShape, concatDim + 1, rank);
     uint64_t outputRowBytes = 0;
-    uint64_t chunksPerOuter = 0;
+    uint64_t smallChunksPerOuter = 0;
+    uint64_t largeChunksPerOuter = 0;
     for (size_t i = 0; i < inputCount; ++i) {
         const auto* storageShape = context->GetDynamicInputShape(0, i);
         if (storageShape == nullptr) {
@@ -78,7 +80,8 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
         const uint64_t segmentBytes = static_cast<uint64_t>(shape.GetDim(concatDim)) * innerSize *
                                       static_cast<uint64_t>(dtypeBytes);
         outputRowBytes += segmentBytes;
-        chunksPerOuter += (segmentBytes + kTileBytes - 1) / kTileBytes;
+        smallChunksPerOuter += (segmentBytes + kSmallTileBytes - 1) / kSmallTileBytes;
+        largeChunksPerOuter += (segmentBytes + kLargeTileBytes - 1) / kLargeTileBytes;
     }
 
     uint32_t maxCoreCount = kFallbackVectorCores;
@@ -90,6 +93,10 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
         }
     }
 
+    const uint64_t largeChunkWorkItems = outerSize * largeChunksPerOuter;
+    const bool largeTileKeepsCoreOccupancy = outerSize >= maxCoreCount || largeChunkWorkItems >= maxCoreCount;
+    const uint32_t tileBytes = largeTileKeepsCoreOccupancy ? kLargeTileBytes : kSmallTileBytes;
+    const uint64_t chunksPerOuter = largeTileKeepsCoreOccupancy ? largeChunksPerOuter : smallChunksPerOuter;
     const uint64_t rowWorkItems = outerSize;
     const uint64_t chunkWorkItems = outerSize * chunksPerOuter;
     const uint64_t rowCoreCount = std::min<uint64_t>(maxCoreCount, rowWorkItems);
@@ -107,7 +114,7 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
     tiling.set_concatDim(concatDim);
     tiling.set_elementBytes(static_cast<uint32_t>(dtypeBytes));
     tiling.set_scheduleMode(rowSchedule ? 0U : 1U);
-    tiling.set_tileBytes(kTileBytes);
+    tiling.set_tileBytes(tileBytes);
 
     context->SetBlockDim(blockDim);
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
