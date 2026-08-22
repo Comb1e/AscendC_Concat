@@ -6,7 +6,7 @@ using namespace AscendC;
 namespace {
 constexpr uint32_t kBufferCount = 2;
 constexpr uint32_t kMaxRank = 8;
-constexpr uint32_t kPreloadedSegmentCount = 32;
+constexpr uint32_t kPreloadedSegmentCount = 16;
 constexpr uint32_t kDataBlockBytes = 32;
 constexpr uint64_t kMaxCopyStride = 0xFFFFFFFFULL;
 constexpr uint64_t kMaxCopyRows = 4095ULL;
