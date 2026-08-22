@@ -11,9 +11,10 @@ at::Tensor ConcatProfile(const std::vector<at::Tensor>& inputs, int64_t dim,
                          const at::IntArrayRef& outputShape)
 {
     TORCH_CHECK(!inputs.empty(), "concat profile requires at least one input");
-    at::Tensor result = at::empty(outputShape, inputs[0].options());
+    at::Tensor result;
     const at::TensorList inputList(inputs);
     for (int64_t round = 0; round < kProfileRounds; ++round) {
+        result = at::empty(outputShape, inputs[0].options());
         EXEC_NPU_CMD(aclnnConcat, inputList, dim, result);
     }
     return result;

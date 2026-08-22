@@ -208,6 +208,7 @@ extern "C" __global__ __aicore__ void concat(
     ListTensorDesc inputList(reinterpret_cast<__gm__ void*>(inputs));
     GlobalTensor<uint8_t> outputTensor;
     outputTensor.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(output));
+    outputTensor.SetL2CacheHint(CacheMode::CACHE_MODE_DISABLE);
 
     TPipe pipe;
     TQueBind<QuePosition::VECIN, QuePosition::VECOUT, kBufferCount> queue;
