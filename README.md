@@ -40,7 +40,9 @@ CONCAT_TECHNICAL_DOCUMENT.md
 Host 已下发 bounded 输入的精确片段长度时，Kernel 应直接复用并保留超限描述符回退；框架每轮
 创建新 Tensor 不代表物理输出地址只写一次，缓存分配器可能复用存储并反转 L2 实验结果；本地
 诊断结果只能作为同环境后续提交的基线，不能直接解释隐藏 Case。更新后的 skill 已通过
-`skill-creator` 的 `quick_validate.py` 校验。
+`skill-creator` 的 `quick_validate.py` 校验。本轮新增经验是：动态输入的 chunk 调度应统计
+`coreCount * inputCount` 级别的无效描述符触达；Host 可在 tiling 容量允许时下发每核连续
+work 区间，并把等字节目标吸附到既有 work-item 边界，从而不增加 DMA 命令。
 
 ## Kernel 地址模型
 
@@ -97,6 +99,7 @@ Concat 不做数值计算，Kernel 使用 `uint8_t` 原始字节搬运统一覆�
 | `0e38813` | 显式回退 `9f07f4a` | 恢复 64/32 KiB tile 和双 Buffer 余量 | 保留 32 输入预加载及 mode 2 回退 |
 | `b702aec` | 保持 chunk 数不变，在每个输入片段内部均衡 chunk 字节数 | 避免略大于 tile 的片段产生大块与极小尾块、造成核间字节失衡 | chunk 路径每个多块片段增加均分计算 |
 | `d430bc0` | 单 chunk 和零长度片段跳过均分除法 | 避免不受益输入承担新增 Scalar 成本 | 多 chunk 路径保持 `b702aec` 行为 |
+| `6ad3bd3` | Host 按字节目标预计算每核连续 chunk 区间，Kernel 只遍历实际覆盖的输入 | 删除 chunk 模式下 `coreCount * inputCount` 的无效列表扫描 | Tiling 扩大到约 1416B；必须验证连续边界映射及大输入吞吐 |
 
 ### 首轮 NPU 反馈与原因分析
 
@@ -468,6 +471,51 @@ mode 2 的上一轮 `574.7515 us`，当前仍慢 `10.5285 us`（`1.83%`）；相
 本核首个 work item，即使该输入没有任何 chunk 分配给该核。下一轮不再继续微调 tile 或尾块，
 改为由 Host 下发每核连续工作区间，减少 Kernel 的 `coreCount * inputCount` 元数据访问。
 
+`localtest.md` 中标记为 `39282b7` 的最新本地汇总也没有显示稳定收益。与上一份 `7695c49`
+汇总的 13 个共同 Case 相比，中位数合计从 `290.164 us` 变为 `290.636 us`，增加
+`0.472 us`（`0.16%`）；均值合计从 `289.694 us` 变为 `288.296 us`，反而减少
+`1.398 us`（`0.48%`）。`chunk_aligned` 中位数增加 `0.230 us`，`max_inputs` 增加
+`1.861 us`，而 `row_aligned` 减少 `1.549 us`。中位数与均值方向相反，且改善/回退没有按
+chunk 路径一致分布，因此本地数据也只能把上一轮判定为测量波动范围内的中性结果。官方和
+本地 Case 仍是两套独立口径，不能把本地合计换算为隐藏总分。
+
+### 下一轮实验：Host 预分区连续 chunk 工作
+
+提交 `6ad3bd3` 改写 chunk 模式的工作分配，但不改变 row 模式、tile 大小、chunk 数、DMA 命令
+总数或每个 chunk 的源/目标区间。旧 Kernel 对每个输入计算当前核对应的模余起点，即使该输入
+没有 work item 属于本核，也必须执行 `LoadInput`、chunk 计算和分支；输入列表较长时，总元数据
+成本近似 `blockDim * inputCount`。新 Host 为每个 AIV 下发：
+
+```text
+chunkStartInput    本核第一个输入
+chunkStartWork     第一个输入内的 work-item 偏移
+chunkWorkCount     本核连续消费的 work-item 数量
+chunkOutputOffset  第一个输入在输出行中的字节前缀
+```
+
+Kernel 从该起点向后推进，完成 `chunkWorkCount` 后立即退出，不再从输入 0 扫描到末尾。Host
+先以 `totalBytes * core / blockDim` 计算每核字节目标，再把边界吸附到现有 chunk work-item
+边界；相邻边界至少相差一个 work item，因此每核非空、全部边界严格递增，且 DMA 工作集合与
+上一版本完全相同。与纯粹按 work-item 数量均分相比，该方法还能避免大小悬殊的单 chunk 输入
+集中到少数核。
+
+910B 最多使用 40 个 AIV；新增 40 项数组后 `ConcatTilingData` 约为 `1416B`，低于当前注册
+接口默认的 `2048B` tiling 上限，并在保存前显式检查实际 capacity。该设计也参考了本机
+CANN 8.5 内置 Concat：内置实现同样由 Host 下发每核 `endTensorIdx/endTensorOffset`，而不是
+让所有核完整扫描 TensorList。
+
+静态区间模型随机验证了 `19965` 组实际进入 chunk 调度的输入，其中 `498` 组展开到每个
+work item；每项均唯一归属一个核，零长度输入能正确跳过，源和目标区间连续且无遗漏。对本地
+`max_inputs`（2 行、256 个 1B 输入），预估输入元数据触达从 `40*256=10240` 次降到约
+`272` 次；新增 `chunk_many_inputs`（1 行、256 个 64 KiB 输入）降到 `256` 次。新增
+`chunk_single_large` 使用同样 16 MiB 总量但只有一个输入，触达次数仍为 `40`，用于判断收益
+来自列表扫描消除还是单纯测量波动。
+
+这是高风险结构性实验。主要风险是更大的 tiling 读取抵消小 Case 收益，以及连续 work 区间
+改变各核同时访问的输入顺序后影响缓存/带宽。若 `chunk_many_inputs` 和 `max_inputs` 明显改善、
+而 `chunk_single_large` 与 `chunk_aligned` 基本持平，才说明假设成立；若单输入大块也显著
+回退，应直接 revert `6ad3bd3`，不再把其他优化叠加到该版本。
+
 ### 下一轮实验：复用 Host 预加载的片段字节数
 
 提交 `2c97dca` 使用当前 Host 已写入 Tiling 的前 16 个输入 `segmentBytes`。此前普通
@@ -548,6 +596,8 @@ bash build.sh
 | `tile_tail` | 输出行跨越 64 KiB tile 且存在非整 tile 尾块 |
 | `chunk_imbalanced_aligned` | 40 个 `65568B` 对齐片段，放大固定 tile 的核间字节失衡 |
 | `chunk_imbalanced_unaligned` | 40 个 `65537B` 非对齐片段，验证均衡尾块的 Pad 路径 |
+| `chunk_many_inputs` | 单行 256 个 64 KiB 输入，放大 chunk 模式的全列表元数据扫描 |
+| `chunk_single_large` | 与上一项同为 16 MiB，但只有一个输入，隔离连续分区自身开销 |
 
 测试工具所需的 ACLNN/PyTorch NPU helper 已复制到
 `local_test/common/pytorch_npu_helper.hpp`，运行时不依赖 `test-ref/`，整个
@@ -672,7 +722,7 @@ PERF_RESULT name=<case> samples=20 median_us=<time> mean_us=<time> min_us=<time>
 
 ```bash
 git log --oneline -12
-# 当前待测版本恢复 64/32 KiB tile，并在多 chunk 片段内均衡各工作项字节数
+# 当前待测版本由 Host 下发每核连续 chunk 工作区间，Kernel 只解析覆盖的输入
 
 bash build.sh
 # 按比赛环境原有流程安装 custom_*.run，运行精度与五个性能样例
@@ -688,12 +738,13 @@ correctness: pass|fail
 times_us: <case1>, <case2>, <case3>, <case4>, <case5>
 ```
 
-本地测试优先回传 `ref`、`chunk_aligned`、`chunk_imbalanced_aligned`、
-`chunk_imbalanced_unaligned` 和 `max_inputs`。前两个检查普通回归，两个新 Case 直接验证字节
-均衡假设，`max_inputs` 覆盖描述符回退。测试扩展已构建时无需因 Python Case 改动执行
-`--build`。当前版本应与本轮官方 `585.256 us`、上一轮 `574.7515 us` 和历史最好
-`573.612 us` 同时比较。若新 chunk 调度回退，先新建 revert 提交依次撤销 `d430bc0` 和
-`b702aec`；`0e38813` 是恢复 64/32 KiB、保留 32 输入预加载且不含 mode 2 的隔离点。
+本地测试优先回传 `max_inputs`、`chunk_many_inputs`、`chunk_single_large`、`chunk_aligned` 和
+`ref`。前三项直接隔离动态列表扫描收益与单输入开销，后两项检查普通 chunk 和 row 回归；
+测试扩展已构建时无需因 Python Case 改动执行 `--build`。当前版本应与刚测得的
+`585.280 us`、不含 chunk 均衡的 `574.7515 us` 和历史最好 `573.612 us` 同时比较。若连续
+预分区回退，先新建 revert 提交撤销 `6ad3bd3`；若还要隔离 chunk 均衡，再依次撤销
+`d430bc0` 和 `b702aec`。`0e38813` 是恢复 64/32 KiB、保留 32 输入预加载且不含 mode 2 的
+隔离点。
 
 更早的累计版本顺序为：
 
