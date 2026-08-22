@@ -11,7 +11,6 @@
 namespace {
 constexpr uint32_t kTileBytes = 32U * 1024U;
 constexpr uint32_t kFallbackVectorCores = 40U;
-constexpr uint64_t kMinRowsForRowSchedule = 8U;
 
 bool NormalizeDim(int64_t rawDim, size_t rank, uint32_t& dim)
 {
@@ -91,9 +90,13 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
         }
     }
 
-    // Row scheduling avoids repeatedly decoding many small tensor descriptors.
-    const bool rowSchedule = outerSize >= kMinRowsForRowSchedule;
-    const uint64_t workItems = rowSchedule ? outerSize : outerSize * chunksPerOuter;
+    const uint64_t rowWorkItems = outerSize;
+    const uint64_t chunkWorkItems = outerSize * chunksPerOuter;
+    const uint64_t rowCoreCount = std::min<uint64_t>(maxCoreCount, rowWorkItems);
+    const uint64_t chunkCoreCount = std::min<uint64_t>(maxCoreCount, chunkWorkItems);
+    // Keep the lower-overhead row path unless chunking activates more AIV cores.
+    const bool rowSchedule = chunkCoreCount <= rowCoreCount;
+    const uint64_t workItems = rowSchedule ? rowWorkItems : chunkWorkItems;
     const uint32_t blockDim = static_cast<uint32_t>(
         std::max<uint64_t>(1, std::min<uint64_t>(maxCoreCount, workItems)));
 

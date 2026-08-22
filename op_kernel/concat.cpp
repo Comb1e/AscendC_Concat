@@ -83,23 +83,22 @@ __aicore__ inline void ProcessByChunks(ListTensorDesc& inputs, GlobalTensor<uint
         }
         const uint64_t segmentBytes = desc.GetShape(tilingData.concatDim) * innerSize * tilingData.elementBytes;
         const uint64_t chunkCount = (segmentBytes + tilingData.tileBytes - 1) / tilingData.tileBytes;
+        const uint64_t inputWorkItems = tilingData.outerSize * chunkCount;
+        const uint64_t firstWorkItem =
+            (blockIdx + blockCount - globalChunkBase % blockCount) % blockCount;
 
         GlobalTensor<uint8_t> source;
         source.SetGlobalBuffer(inputs.GetDataPtr<uint8_t>(inputIdx));
-        for (uint64_t outer = 0; outer < tilingData.outerSize; ++outer) {
-            const uint64_t workBase = globalChunkBase + outer * chunkCount;
-            const uint64_t firstChunk =
-                (blockIdx + blockCount - workBase % blockCount) % blockCount;
-
-            for (uint64_t chunk = firstChunk; chunk < chunkCount; chunk += blockCount) {
-                const uint64_t copied = chunk * tilingData.tileBytes;
-                const uint32_t bytes = static_cast<uint32_t>(
-                    MinU64(tilingData.tileBytes, segmentBytes - copied));
-                const uint64_t outputOffset = outer * tilingData.outputRowBytes + outputInputOffset;
-                CopyBytes(output, outputOffset + copied, source, outer * segmentBytes + copied, bytes, queue);
-            }
+        for (uint64_t workItem = firstWorkItem; workItem < inputWorkItems; workItem += blockCount) {
+            const uint64_t outer = workItem / chunkCount;
+            const uint64_t chunk = workItem - outer * chunkCount;
+            const uint64_t copied = chunk * tilingData.tileBytes;
+            const uint32_t bytes = static_cast<uint32_t>(
+                MinU64(tilingData.tileBytes, segmentBytes - copied));
+            const uint64_t outputOffset = outer * tilingData.outputRowBytes + outputInputOffset;
+            CopyBytes(output, outputOffset + copied, source, outer * segmentBytes + copied, bytes, queue);
         }
-        globalChunkBase += tilingData.outerSize * chunkCount;
+        globalChunkBase += inputWorkItems;
         outputInputOffset += segmentBytes;
     }
 }
