@@ -40,9 +40,11 @@ CONCAT_TECHNICAL_DOCUMENT.md
 Host 已下发 bounded 输入的精确片段长度时，Kernel 应直接复用并保留超限描述符回退；框架每轮
 创建新 Tensor 不代表物理输出地址只写一次，缓存分配器可能复用存储并反转 L2 实验结果；本地
 诊断结果只能作为同环境后续提交的基线，不能直接解释隐藏 Case。更新后的 skill 已通过
-`skill-creator` 的 `quick_validate.py` 校验。本轮新增经验是：动态输入的 chunk 调度应统计
-`coreCount * inputCount` 级别的无效描述符触达；Host 可在 tiling 容量允许时下发每核连续
-work 区间，并把等字节目标吸附到既有 work-item 边界，从而不增加 DMA 命令。
+`skill-creator` 的 `quick_validate.py` 校验。本轮新增经验是：动态输入的 chunk 调度应同时统计
+`coreCount * inputCount` 级别的描述符触达、Tiling 体积和隐藏形状分布；专门构造的 256 输入
+本地 Case 即使大幅受益，也不能证明 Host 大数组预分区适合作为通用默认路径。对 910B 上的
+2B/4B 非对齐小行，可把各输入按 32B 行距搬入 staging UB，用 byte offset `Gather` 压紧后
+批量写回；必须用独立 schedule、UB 预算和 INT8/大行回退隔离风险。
 
 ## Kernel 地址模型
 
@@ -100,6 +102,12 @@ Concat 不做数值计算，Kernel 使用 `uint8_t` 原始字节搬运统一覆�
 | `b702aec` | 保持 chunk 数不变，在每个输入片段内部均衡 chunk 字节数 | 避免略大于 tile 的片段产生大块与极小尾块、造成核间字节失衡 | chunk 路径每个多块片段增加均分计算 |
 | `d430bc0` | 单 chunk 和零长度片段跳过均分除法 | 避免不受益输入承担新增 Scalar 成本 | 多 chunk 路径保持 `b702aec` 行为 |
 | `6ad3bd3` | Host 按字节目标预计算每核连续 chunk 区间，Kernel 只遍历实际覆盖的输入 | 删除 chunk 模式下 `coreCount * inputCount` 的无效列表扫描 | 本地长列表有效，但官方总耗时回退 2.74%，已判为不适合隐藏样例 |
+| `1a3d26d` | 显式撤销 Host 连续 chunk 预分区 | 删除约 1.1 KiB 核级 Tiling 数组和起点恢复逻辑 | 后续不再保留该本地特化作为默认路径 |
+| `4c8e8de` | 显式撤销单 chunk 均衡捷径 | 继续恢复历史最优 chunk 公式 | 与下一项 revert 成对恢复 |
+| `f5635b6` | 显式撤销段内 chunk 字节均衡 | 删除未获得官方净收益的除法与对齐计算 | 恢复固定 64/32 KiB chunk |
+| `84a2755` | 将元数据预加载上限从 32 恢复为 16 | 回到官方历史最优 `2c97dca` 的小 Tiling 原则 | 17 输入以上继续使用描述符回退 |
+| `1d9435c` | 非对齐 FP16/FP32 小行使用 staging UB + `Gather` 压紧并批量写回 | 将每批 MTE3 命令从输入数降为 1，直接针对未优化的非对齐整行场景 | 高风险待上板；增加 Vector pass 与 offset buffer，INT8/大行必须回退 |
+| `3988b0f` | 增加 Gather 命中、DType 回退、8 KiB 阈值和零长度输入边界 Case | 快速验证新 schedule 的正确性与收益来源 | 本地结果仍不对应官方隐藏 Case |
 
 ### 首轮 NPU 反馈与原因分析
 
@@ -565,7 +573,36 @@ Case1/2 的 `2.484/8.424 us` 回退远大于前几轮小 Case 的普通波动，
 - [DataCopyPad 参数与非对齐 dummy 规则](https://www.hiascend.com/document/detail/zh/canncommercial/81RC1/apiref/ascendcopapi/atlasascendc_api_07_0265.html)
 - [Compact 模式的产品限制](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/900beta2/opdevg/Ascendcopdevg/atlas_ascendc_best_practices_10_00017.html)
 
-### 下一轮实验：复用 Host 预加载的片段字节数
+### 当前实验：非对齐小行 staging + Gather
+
+提交 `1a3d26d`、`4c8e8de`、`f5635b6`、`84a2755` 依次撤销 Host chunk 预分区、两项 chunk
+均衡逻辑和 32 输入预加载。回退完成后，`op_host/concat.cpp`、`op_host/concat_tiling.h`、
+`op_kernel/concat.cpp` 与历史最好 `2c97dca` 无差异。提交 `1d9435c` 再从该基线增加独立的
+`scheduleMode=2`，仅在下列条件全部满足时启用：
+
+- 使用 row schedule，存在非 32B 对齐片段；
+- 输入数不超过 16，Host 已预加载全部 `segmentBytes`；
+- 元素宽度为 2B 或 4B，输出行非空且不超过 8 KiB；
+- offset buffer、staging 行和连续输出行合计不超过每核 160 KiB UB 预算。
+
+每个输入通过一次多行 `DataCopyPad` 写入 staging；相邻输入的 staging 起点向上对齐到 32B。
+Host/Kernel 共享的 `segmentBytes` 生成一行 byte offset map，Kernel 每核只生成一次。随后每行
+`Gather` 把 padding 空洞压紧到连续输出 UB，一批行最终用一次 `DataCopyPad` 写回 GM。旧路径
+每批需要 `inputCount` 次 MTE3，新路径只需 1 次，但额外引入 `outputElements` 个 32-bit offset
+和一遍 Vector Gather，因此它不是对所有非对齐行都必然更快。
+
+INT8 因 910B Gather 类型限制保持旧路径；全对齐行继续使用已验证的整行融合；超过 16 输入、
+超过 8 KiB 的行和 chunk schedule 也保持 `2c97dca` 行为。静态字节区间模型对 FP16/FP32
+各 2000 组随机切分验证了 staging + offset map 与直接 concat 完全一致。Host tiling 已在
+本机成功编译和链接；Kernel 构建在调用编译器前因 Python 环境缺少 `decorator` 终止，故仍需
+在正确 CANN 环境确认 Kernel 编译、bit-exact 精度和性能。
+
+提交 `3988b0f` 新增 FP32 命中、INT8 回退、恰好 8 KiB、8 KiB+2B 和零长度片段 Case。
+优先比较 `row_unaligned` 与同环境历史 `2c97dca`；若 FP16/FP32 均回退，说明 Gather 的 Vector
+成本高于 MTE3 命令节省，应直接 revert `1d9435c`。若小行改善而 `compact_limit` 回退，则应
+下调 8 KiB 阈值，而不是否定整个方向。
+
+### 历史实验：复用 Host 预加载的片段字节数
 
 提交 `2c97dca` 使用当前 Host 已写入 Tiling 的前 16 个输入 `segmentBytes`。此前普通
 row/chunk Kernel 仍对每个输入调用 `GetDesc`，将 shape 从 GM 复制到核侧缓冲，再循环计算 `innerSize` 和
@@ -617,7 +654,9 @@ bash build.sh
 
 成功后应在 `build_out/` 中得到 `custom_*.run`。构建脚本会重新生成 `.build/`，因此不要在该目录保存手工修改。
 
-本次开发环境没有 NPU。曾启动本地构建并完成 Host 编译、进入 Kernel 生成阶段，但按要求提前停止，因此不能把当前版本声明为完整编译通过或 NPU 验证通过。
+本次开发环境没有 NPU。本轮构建已完成 Host tiling 编译和链接；Kernel 生成阶段在 Ascend C
+编译前因本机 Python 缺少 `decorator` 失败，因此不能把当前版本声明为完整编译通过或 NPU
+验证通过。
 
 ## 本地快速测试
 
@@ -632,21 +671,22 @@ bash build.sh
 | 名称 | 主要用途 |
 | --- | --- |
 | `ref` | 复现参考目录中的 `[128, 256]`、FP16、末轴随机拆分 |
-| `row_unaligned` | 多 outer 行、非 32B 对齐片段和多行 `DataCopyPad` |
+| `row_unaligned` | FP16 多 outer 行、非对齐 Gather 主性能 Case |
+| `row_unaligned_fp32` | FP32 非对齐 Gather DType 分支 |
+| `row_unaligned_int8` | 同形状 INT8，验证不支持 Gather 时保持旧路径 |
+| `compact_limit` | 16 输入、FP16、输出行恰好 8 KiB，验证启用阈值 |
+| `compact_over_limit` | 16 输入、FP16、输出行 8 KiB+2B，验证大行回退 |
+| `compact_zero_segments` | Gather 路径中的前缀/中间零长度输入 |
 | `row_aligned` | 多 outer 行、32B 对齐片段及 UB 内融合写回路径 |
 | `chunk_aligned` | `outerSize=1` 的大对齐片段、多核 chunk 调度 |
-| `fused_tiles` | 16 个 32 KiB 对齐片段组成 512 KiB 大行，直接覆盖 mode 2 跨输入 tile 融合 |
+| `fused_tiles` | 16 个 32 KiB 对齐片段组成 512 KiB 大行，验证大行仍走 chunk 回退 |
 | `many_inputs` | ACLNN 上限 256 个小片段，放大动态 TensorList 元数据开销 |
 | `single_input` | 单输入退化路径，检查无拼接边界时的地址和调度 |
 | `zero_segments` | 零长度前缀和中间输入，检查跳过空片段后的输出偏移 |
-| `preload_16` / `preload_17` | 16/32 元数据预加载边界及全对齐整行融合 |
+| `preload_16` / `preload_17` | 16 输入预加载边界及 17 输入描述符回退 |
 | `max_inputs` | ACLNN 256 输入上限的描述符回退路径 |
 | `rank4_axis0` | Rank4 首轴拼接、负/正轴地址模型和零长度片段 |
 | `tile_tail` | 输出行跨越 64 KiB tile 且存在非整 tile 尾块 |
-| `chunk_imbalanced_aligned` | 40 个 `65568B` 对齐片段，放大固定 tile 的核间字节失衡 |
-| `chunk_imbalanced_unaligned` | 40 个 `65537B` 非对齐片段，验证均衡尾块的 Pad 路径 |
-| `chunk_many_inputs` | 单行 256 个 64 KiB 输入，放大 chunk 模式的全列表元数据扫描 |
-| `chunk_single_large` | 与上一项同为 16 MiB，但只有一个输入，隔离连续分区自身开销 |
 
 测试工具所需的 ACLNN/PyTorch NPU helper 已复制到
 `local_test/common/pytorch_npu_helper.hpp`，运行时不依赖 `test-ref/`，整个
@@ -771,29 +811,40 @@ PERF_RESULT name=<case> samples=20 median_us=<time> mean_us=<time> min_us=<time>
 
 ```bash
 git log --oneline -12
-# 当前待测版本由 Host 下发每核连续 chunk 工作区间，Kernel 只解析覆盖的输入
+# 当前算子源码实验为 1d9435c：非对齐 FP16/FP32 小行 staging + Gather
 
 bash build.sh
 # 按比赛环境原有流程安装 custom_*.run，运行精度与五个性能样例
+```
+
+安装后先运行分支隔离用例；测试扩展已经构建时不需要再次传 `--build`：
+
+```bash
+CONCAT_CODE_COMMIT=1d9435c bash local_test/run.sh ref
+CONCAT_CODE_COMMIT=1d9435c bash local_test/run.sh row_unaligned
+CONCAT_CODE_COMMIT=1d9435c bash local_test/run.sh row_unaligned_fp32
+CONCAT_CODE_COMMIT=1d9435c bash local_test/run.sh row_unaligned_int8
+CONCAT_CODE_COMMIT=1d9435c bash local_test/run.sh compact_limit
+CONCAT_CODE_COMMIT=1d9435c bash local_test/run.sh compact_over_limit
+CONCAT_CODE_COMMIT=1d9435c bash local_test/run.sh compact_zero_segments
+CONCAT_CODE_COMMIT=1d9435c bash local_test/run.sh row_aligned
 ```
 
 性能测试应先预热，再在相同环境重复运行并取中位数。请同时记录精度结果、SoC/CANN 版本和 commit：
 
 ```text
 commit: <git rev-parse --short HEAD 的输出>
-code_baseline: <git rev-parse --short HEAD 的输出>
+code_baseline: <算子源码 commit；当前为 1d9435c>
 soc/cann: <version>
 correctness: pass|fail
 times_us: <case1>, <case2>, <case3>, <case4>, <case5>
 ```
 
-本地测试优先回传 `max_inputs`、`chunk_many_inputs`、`chunk_single_large`、`chunk_aligned` 和
-`ref`。前三项直接隔离动态列表扫描收益与单输入开销，后两项检查普通 chunk 和 row 回归；
-测试扩展已构建时无需因 Python Case 改动执行 `--build`。当前版本应与刚测得的
-`585.280 us`、不含 chunk 均衡的 `574.7515 us` 和历史最好 `573.612 us` 同时比较。若连续
-预分区回退，先新建 revert 提交撤销 `6ad3bd3`；若还要隔离 chunk 均衡，再依次撤销
-`d430bc0` 和 `b702aec`。`0e38813` 是恢复 64/32 KiB、保留 32 输入预加载且不含 mode 2 的
-隔离点。
+本地测试优先回传 `ref`、`row_unaligned`、`row_unaligned_fp32`、`row_unaligned_int8`、
+`compact_limit`、`compact_over_limit`、`compact_zero_segments` 和 `row_aligned`。测试扩展已
+构建时无需因 Python Case 改动执行 `--build`。当前官方主要比较点是历史最好 `573.612 us`；
+`601.332 us` 是已撤销的 Host chunk 预分区负例。若新版本精度失败或 FP16/FP32 小行均明显
+回退，应新建 revert 提交撤销 `1d9435c`，即可精确恢复 `2c97dca` 算子源码。
 
 更早的累计版本顺序为：
 
