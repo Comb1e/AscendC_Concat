@@ -9,6 +9,7 @@ constexpr uint32_t kMaxRank = 8;
 constexpr uint32_t kDataBlockBytes = 32;
 constexpr uint64_t kMaxCopyStride = 0xFFFFFFFFULL;
 constexpr uint64_t kMaxCopyRows = 4095ULL;
+constexpr uint64_t kMaxAlignedCopyStride = 65535ULL * kDataBlockBytes;
 
 __aicore__ inline uint64_t MinU64(uint64_t lhs, uint64_t rhs)
 {
@@ -19,25 +20,37 @@ template <typename Queue>
 __aicore__ inline void CopyStridedBytes(GlobalTensor<uint8_t>& destination, uint64_t destinationOffset,
                                         GlobalTensor<uint8_t>& source, uint64_t sourceOffset,
                                         uint16_t rows, uint32_t bytes, uint32_t sourceStride,
-                                        uint32_t destinationStride, Queue& queue)
+                                        uint32_t destinationStride, bool aligned, Queue& queue)
 {
-    DataCopyExtParams copyInParams{rows, bytes, sourceStride, 0, 0};
-    DataCopyExtParams copyOutParams{rows, bytes, 0, destinationStride, 0};
-    DataCopyPadExtParams<uint8_t> padParams{false, 0, 0, 0};
     LocalTensor<uint8_t> local = queue.template AllocTensor<uint8_t>();
-    DataCopyPad(local, source[sourceOffset], copyInParams, padParams);
+    if (aligned) {
+        DataCopyParams copyInParams{rows, static_cast<uint16_t>(bytes / kDataBlockBytes),
+                                    static_cast<uint16_t>(sourceStride / kDataBlockBytes), 0};
+        DataCopy(local, source[sourceOffset], copyInParams);
+    } else {
+        DataCopyExtParams copyInParams{rows, bytes, sourceStride, 0, 0};
+        DataCopyPadExtParams<uint8_t> padParams{false, 0, 0, 0};
+        DataCopyPad(local, source[sourceOffset], copyInParams, padParams);
+    }
     queue.template EnQue<QuePosition::VECIN, QuePosition::VECOUT, uint8_t>(local);
     local = queue.template DeQue<QuePosition::VECIN, QuePosition::VECOUT, uint8_t>();
-    DataCopyPad(destination[destinationOffset], local, copyOutParams);
+    if (aligned) {
+        DataCopyParams copyOutParams{rows, static_cast<uint16_t>(bytes / kDataBlockBytes), 0,
+                                     static_cast<uint16_t>(destinationStride / kDataBlockBytes)};
+        DataCopy(destination[destinationOffset], local, copyOutParams);
+    } else {
+        DataCopyExtParams copyOutParams{rows, bytes, 0, destinationStride, 0};
+        DataCopyPad(destination[destinationOffset], local, copyOutParams);
+    }
     queue.FreeTensor(local);
 }
 
 template <typename Queue>
 __aicore__ inline void CopyBytes(GlobalTensor<uint8_t>& destination, uint64_t destinationOffset,
                                  GlobalTensor<uint8_t>& source, uint64_t sourceOffset,
-                                 uint32_t bytes, Queue& queue)
+                                 uint32_t bytes, bool aligned, Queue& queue)
 {
-    CopyStridedBytes(destination, destinationOffset, source, sourceOffset, 1, bytes, 0, 0, queue);
+    CopyStridedBytes(destination, destinationOffset, source, sourceOffset, 1, bytes, 0, 0, aligned, queue);
 }
 
 template <typename Queue>
@@ -88,8 +101,11 @@ __aicore__ inline void ProcessByRows(ListTensorDesc& inputs, GlobalTensor<uint8_
                 const uint32_t copySourceStride = batchRows > 1 ? static_cast<uint32_t>(sourceStride) : 0;
                 const uint32_t copyDestinationStride =
                     batchRows > 1 ? static_cast<uint32_t>(destinationStride) : 0;
+                const bool aligned = tilingData.allSegmentsAligned != 0 &&
+                                     (batchRows == 1 || (sourceStride <= kMaxAlignedCopyStride &&
+                                                        destinationStride <= kMaxAlignedCopyStride));
                 CopyStridedBytes(output, outputOffset, source, sourceOffset, batchRows, bytes,
-                                 copySourceStride, copyDestinationStride, queue);
+                                 copySourceStride, copyDestinationStride, aligned, queue);
                 row += batchRows;
             }
             copied += bytes;
@@ -133,7 +149,8 @@ __aicore__ inline void ProcessByChunks(ListTensorDesc& inputs, GlobalTensor<uint
             const uint32_t bytes = static_cast<uint32_t>(
                 MinU64(tilingData.tileBytes, segmentBytes - copied));
             const uint64_t outputOffset = outer * tilingData.outputRowBytes + outputInputOffset;
-            CopyBytes(output, outputOffset + copied, source, outer * segmentBytes + copied, bytes, queue);
+            CopyBytes(output, outputOffset + copied, source, outer * segmentBytes + copied, bytes,
+                      tilingData.allSegmentsAligned != 0, queue);
         }
         globalChunkBase += inputWorkItems;
         outputInputOffset += segmentBytes;

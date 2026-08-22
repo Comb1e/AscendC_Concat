@@ -62,6 +62,7 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
     uint64_t outputRowBytes = 0;
     uint64_t smallChunksPerOuter = 0;
     uint64_t largeChunksPerOuter = 0;
+    bool allSegmentsAligned = true;
     for (size_t i = 0; i < inputCount; ++i) {
         const auto* storageShape = context->GetDynamicInputShape(0, i);
         if (storageShape == nullptr) {
@@ -82,6 +83,7 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
         outputRowBytes += segmentBytes;
         smallChunksPerOuter += (segmentBytes + kSmallTileBytes - 1) / kSmallTileBytes;
         largeChunksPerOuter += (segmentBytes + kLargeTileBytes - 1) / kLargeTileBytes;
+        allSegmentsAligned = allSegmentsAligned && segmentBytes % 32U == 0;
     }
 
     uint32_t maxCoreCount = kFallbackVectorCores;
@@ -115,6 +117,7 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
     tiling.set_elementBytes(static_cast<uint32_t>(dtypeBytes));
     tiling.set_scheduleMode(rowSchedule ? 0U : 1U);
     tiling.set_tileBytes(tileBytes);
+    tiling.set_allSegmentsAligned(allSegmentsAligned ? 1U : 0U);
 
     context->SetBlockDim(blockDim);
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
