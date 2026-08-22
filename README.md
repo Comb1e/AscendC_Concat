@@ -12,7 +12,7 @@ non-32-byte-aligned shapes are supported.
 
 Build on the CANN 8.5 / Ascend 910B environment with:
 
-    bash concat/build.sh
+    build.sh
 
 The PyTorch invocation wrapper must call aclnnConcat, not the built-in
 aclnnCat, when validating this custom operator.
