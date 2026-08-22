@@ -95,6 +95,18 @@ CASES = {
         "dim": -1,
         "splits": [65536, 4464],
     },
+    "chunk_imbalanced_aligned": {
+        "shape": (1, 2622720),
+        "dtype": torch.int8,
+        "dim": -1,
+        "splits": [65568] * 40,
+    },
+    "chunk_imbalanced_unaligned": {
+        "shape": (1, 2621480),
+        "dtype": torch.int8,
+        "dim": -1,
+        "splits": [65537] * 40,
+    },
 }
 
 

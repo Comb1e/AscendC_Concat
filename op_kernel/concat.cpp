@@ -17,6 +17,11 @@ __aicore__ inline uint64_t MinU64(uint64_t lhs, uint64_t rhs)
     return lhs < rhs ? lhs : rhs;
 }
 
+__aicore__ inline uint64_t CeilDivU64(uint64_t value, uint64_t divisor)
+{
+    return value == 0 ? 0 : 1 + (value - 1) / divisor;
+}
+
 __aicore__ inline uint64_t LoadInput(ListTensorDesc& inputs, uint32_t inputIdx,
                                     const ConcatTilingData& tilingData,
                                     GlobalTensor<uint8_t>& source)
@@ -193,7 +198,11 @@ __aicore__ inline void ProcessByChunks(ListTensorDesc& inputs, GlobalTensor<uint
     for (uint32_t inputIdx = 0; inputIdx < tilingData.inputCount; ++inputIdx) {
         GlobalTensor<uint8_t> source;
         const uint64_t segmentBytes = LoadInput(inputs, inputIdx, tilingData, source);
-        const uint64_t chunkCount = (segmentBytes + tilingData.tileBytes - 1) / tilingData.tileBytes;
+        const uint64_t chunkCount = CeilDivU64(segmentBytes, tilingData.tileBytes);
+        const uint64_t averageChunkBytes =
+            chunkCount == 0 ? 0 : CeilDivU64(segmentBytes, chunkCount);
+        const uint64_t balancedChunkBytes =
+            CeilDivU64(averageChunkBytes, kDataBlockBytes) * kDataBlockBytes;
         const uint64_t inputWorkItems = tilingData.outerSize * chunkCount;
         const uint64_t firstWorkItem =
             (blockIdx + blockCount - globalChunkBase % blockCount) % blockCount;
@@ -201,9 +210,9 @@ __aicore__ inline void ProcessByChunks(ListTensorDesc& inputs, GlobalTensor<uint
         for (uint64_t workItem = firstWorkItem; workItem < inputWorkItems; workItem += blockCount) {
             const uint64_t outer = workItem / chunkCount;
             const uint64_t chunk = workItem - outer * chunkCount;
-            const uint64_t copied = chunk * tilingData.tileBytes;
+            const uint64_t copied = chunk * balancedChunkBytes;
             const uint32_t bytes = static_cast<uint32_t>(
-                MinU64(tilingData.tileBytes, segmentBytes - copied));
+                MinU64(balancedChunkBytes, segmentBytes - copied));
             const uint64_t outputOffset = outer * tilingData.outputRowBytes + outputInputOffset;
             CopyBytes(output, outputOffset + copied, source, outer * segmentBytes + copied, bytes,
                       tilingData.allSegmentsAligned != 0, queue);
