@@ -88,6 +88,9 @@ Concat 不做数值计算，Kernel 使用 `uint8_t` 原始字节搬运统一覆�
 | `618125d` | 对齐大行按输出 tile 在 UB 中组装后单次写回 | 合并跨输入边界的 MTE3，重点改善大搬运 Case | 仅在不减少活跃 AIV 数时启用 |
 | `d6a5a57` | 删除对齐大行输出 tile 融合，恢复历史最优 Kernel | 消除逐 tile 输入扫描和区间计算 | Host/Kernel 与 `b717f0a` 完全一致 |
 | `2c97dca` | 16 输入以内复用 Host 预加载片段长度，融合行每核缓存输入地址 | 减少 `GetDesc`、shape 乘积和重复 TensorList 地址读取 | 多输入通用路径保持原实现 |
+| `98cc5f6` | 将 Host 片段长度预加载范围从 16 扩展到 32 | 覆盖 17～32 输入的常见动态列表边界 | Tiling 数据增大；需验证中等输入数是否受益 |
+| `f3aa07d` | 大型全对齐输出行重新启用 tile 融合，但按核连续分配 tile 并递增维护输入边界 | 在大行场景减少 MTE3 写回，同时消除上一版逐 tile 重复前缀扫描 | 高风险；仅输出至少 8 个 tile 时启用，需优先检查精度和 Case5 |
+| `0189f03` | 在 `local_test` 增加输入数、零长度、Rank4 首轴和 tile 尾块边界 Case | 快速暴露预加载上下限、零片段和二维地址错误 | 本地诊断不代表官方隐藏样例 |
 
 ### 首轮 NPU 反馈与原因分析
 
@@ -240,6 +243,81 @@ Scalar 控制开销；按输出 tile 交错访问不同输入还可能弱化旧 
 - [CANN 8.5 ListTensorDesc API](https://www.hiascend.com/document/detail/en/canncommercial/850/API/ascendcopapi/atlasascendc_api_07_0009.html)
 - [Ascend C API 使用优化](https://www.hiascend.com/developer/techArticles/20241107-1)
 
+### `2c97dca` 后的官方结果与原因分析
+
+官方测试对删除 mode 2、并复用前 16 个输入元数据的累计版本测得：
+
+| Case | `618125d`/us | `2c97dca`/us | 差值/us | 变化率 |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 13.880 | 11.140 | -2.740 | -19.74% |
+| 2 | 35.148 | 32.4705 | -2.6775 | -7.62% |
+| 3 | 21.920 | 22.390 | +0.470 | +2.14% |
+| 4 | 108.512 | 103.653 | -4.859 | -4.48% |
+| 5 | 414.000 | 403.9585 | -10.0415 | -2.43% |
+| 合计 | 593.460 | 573.612 | -19.848 | -3.35% |
+
+相对历史最好累计版本 `578.9805 us`，当前再减少 `5.3685 us`（`0.93%`）；距离用户提出的
+`540 us` 满意线还差 `33.612 us`，距离已知约 `206 us` 的领先结果仍有 `2.78x` 差距。
+Case5 仍占总耗时 `70.43%`，所以下一步不能只围绕小 Case 的 Scalar 微优化。
+
+本轮收益与 `2c97dca` 的边界访问优化一致：Case1/2/4 均明显下降，说明隐藏样例中至少有
+多个输入数不超过预加载范围、且动态描述符解析占据可见比例。Case3 上升 `0.47 us`，绝对值
+接近小算子测量波动，不能据此否定该方向；Case5 下降 `10.0415 us`，但它同时受缓存、DMA
+和调度影响，不能把全部收益归因于元数据。相比 `618125d` 的回退，主要修复来自删除逐
+输出 tile 的重复输入扫描；这也说明上一轮 mode 2 的控制流成本确实覆盖了其 MTE3 合并收益。
+
+用户提供的 `localtest.md` 同环境记录也支持保留预加载方向：
+
+| 本地 Case | `618125d` median/us | `2c97dca` median/us | 变化率 |
+| --- | ---: | ---: | ---: |
+| `ref` | 13.530 | 10.620 | -21.51% |
+| `row_unaligned` | 20.011 | 17.601 | -12.04% |
+| `row_aligned` | 36.571 | 36.971 | +1.09% |
+| `chunk_aligned` | 16.660 | 15.650 | -6.06% |
+| `fused_tiles` | 11.040 | 10.450 | -5.34% |
+| `many_inputs` | 89.431 | 88.872 | -0.63% |
+
+这组本地输入不是官方五个隐藏样例，不能直接换算排名；它的价值是说明 `many_inputs=256`
+在通用描述符回退路径上基本不变，而 16 输入以内的 `ref`、行和 chunk Case 有明显改善。
+
+### 下一轮实验：32 输入预加载与大行 tile 融合
+
+提交 `98cc5f6` 将 `ConcatTilingData.segmentBytes` 从 16 扩展到 32 项，`inputCount <= 32`
+时复用 Host 精确计算的片段长度和 `GetDataPtr`，并使 17～32 个全对齐、单行不超过 UB 的
+输入可进入已有整行融合写回。超过 32 输入仍使用 `GetDesc`，因此 `max_inputs=256` 继续是
+通用路径对照。该改动只增加 128 字节 Tiling 数据，但是否抵消加载和缓存收益必须上板确认。
+
+提交 `f3aa07d` 是本轮更高风险的方向。它重新启用 `scheduleMode=2`，但设置为仅当输出行至少
+包含 8 个 64 KiB tile、输入数不超过 32 且片段全部 32B 对齐时才使用。与已回退的
+`618125d` 不同，新 Kernel：
+
+- 将 tile 工作项按核分配为连续区间，而不是 `blockIdx + blockCount` 交错访问；
+- 每核在同一 output row 内递增维护 `inputIdx/inputStart`，避免每个 tile 从输入 0 扫描；
+- 当 tile 只覆盖某个输入的前半段时保留该输入作为下一 tile 起点，源偏移继续递增；
+- 仍在 UB 内按输入交集搬入，并对每个完整 tile 只执行一次 MTE3。
+
+这是一项有意扩大风险的实验，目标是接近 CANN 内置 Concat 的二维输出分块模型。静态随机
+10000 组片段区间检查已验证交集覆盖连续、无遗漏和重复；但当前环境没有 CANN Kernel 编译
+和 NPU，不能替代上板精度。若官方结果回退，优先新建回退提交恢复 `98cc5f6`，再按需要
+单独测试 32 输入预加载；不要重写历史提交。
+
+本轮 `local_test` 增加以下边界输入，均不依赖 `test-ref/`：`single_input`（1 输入）、
+`zero_segments`（零长度前缀/中间片段）、`preload_16`、`preload_17`（预加载边界）、
+`max_inputs`（256 输入）、`rank4_axis0`（Rank4 首轴和零片段）以及 `tile_tail`
+（跨 64 KiB tile 的非整行尾块）。当前只完成 Python 语法、分片约束和主机区间静态检查，
+请在 NPU 环境优先运行：
+
+```bash
+bash local_test/run.sh preload_16
+bash local_test/run.sh preload_17
+bash local_test/run.sh fused_tiles
+bash local_test/run.sh tile_tail
+bash local_test/run.sh max_inputs
+```
+
+如需一次跑完所有新增边界，使用 `bash local_test/run.sh all`；当前 `run.sh` 会按 `CASES`
+列表逐个执行并检查自定义 `aclnnConcat` 符号。
+
 ### 下一轮实验：复用 Host 预加载的片段字节数
 
 提交 `2c97dca` 使用当前 Host 已写入 Tiling 的前 16 个输入 `segmentBytes`。此前普通
@@ -312,6 +390,12 @@ bash build.sh
 | `chunk_aligned` | `outerSize=1` 的大对齐片段、多核 chunk 调度 |
 | `fused_tiles` | 16 个 32 KiB 对齐片段组成 512 KiB 大行，直接覆盖 mode 2 跨输入 tile 融合 |
 | `many_inputs` | ACLNN 上限 256 个小片段，放大动态 TensorList 元数据开销 |
+| `single_input` | 单输入退化路径，检查无拼接边界时的地址和调度 |
+| `zero_segments` | 零长度前缀和中间输入，检查跳过空片段后的输出偏移 |
+| `preload_16` / `preload_17` | 16/32 元数据预加载边界及全对齐整行融合 |
+| `max_inputs` | ACLNN 256 输入上限的描述符回退路径 |
+| `rank4_axis0` | Rank4 首轴拼接、负/正轴地址模型和零长度片段 |
+| `tile_tail` | 输出行跨越 64 KiB tile 且存在非整 tile 尾块 |
 
 测试工具所需的 ACLNN/PyTorch NPU helper 已复制到
 `local_test/common/pytorch_npu_helper.hpp`，运行时不依赖 `test-ref/`，整个
@@ -423,7 +507,7 @@ PERF_RESULT name=<case> samples=20 median_us=<time> min_us=<time> max_us=<time>
 
 ```bash
 git log --oneline -12
-# 当前待测版本应已删除 mode 2，并包含 16 输入以内的预加载片段元数据复用
+# 当前待测版本包含 32 输入以内的元数据预加载，并对 >=8 tile 的大行启用受限 mode 2
 
 bash build.sh
 # 按比赛环境原有流程安装 custom_*.run，运行精度与五个性能样例
@@ -439,13 +523,12 @@ correctness: pass|fail
 times_us: <case1>, <case2>, <case3>, <case4>, <case5>
 ```
 
-本地测试优先回传 `ref`、`row_aligned`、`fused_tiles` 和 `many_inputs`；其中 `ref` 对应已知
-Case2 的 `[128, 256]` FP16、9 个非对齐随机片段，直接覆盖当前预加载元数据实验；
-`row_aligned` 覆盖 `b041908` 路径；`fused_tiles` 观察撤销 mode 2 后的变化；`many_inputs`
-超过 16 输入，应继续走通用描述符路径。测试扩展已构建时无需因 Python case 改动执行
-`--build`。下一轮官方结果必须与默认缓存基线 `578.9805 us` 比较。若性能回退，先回到
-`d6a5a57`；若还需隔离更早改动，再测试 `767c220` 排除 UB 融合路径，最后用 `75eec09`
-复现 `589.168 us` 结果。
+本地测试优先回传 `ref`、`preload_16`、`preload_17`、`fused_tiles`、`tile_tail` 和
+`max_inputs`；其中 `ref` 对应已知 Case2 的 `[128, 256]` FP16、9 个非对齐随机片段，
+`preload_16/17` 覆盖新边界，`fused_tiles/tile_tail` 覆盖受限 mode 2，`max_inputs` 覆盖
+描述符回退。测试扩展已构建时无需因 Python case 改动执行 `--build`。下一轮官方结果必须
+与默认缓存基线 `578.9805 us` 比较；若 `f3aa07d` 回退，先新建回退提交恢复 `98cc5f6`，
+再按需隔离 `2c97dca`。更早的 `d6a5a57` 仍是完全删除 mode 2 的稳定恢复点。
 
 更早的累计版本顺序为：
 
