@@ -33,6 +33,9 @@ CONCAT_TECHNICAL_DOCUMENT.md
 ```
 
 可通过 `$ascendc-operator-tuning` 调用，用于后续 Ascend C 算子开发、审查、DMA/UB 调优和 NPU 性能试验设计。
+本轮已补充两条可复用经验：L2 策略应按输入/输出的生命周期分别实验；性能复现除了 shape，
+还必须匹配输入复用、逐轮输出分配、分配器复用及中间算子造成的缓存行为。更新后的 skill
+已通过 `skill-creator` 的 `quick_validate.py` 校验。
 
 ## Kernel 地址模型
 
@@ -75,6 +78,7 @@ Concat 不做数值计算，Kernel 使用 `uint8_t` 原始字节搬运统一覆�
 | `75eec09` | 移除输入 L2 bypass，恢复默认缓存策略 | 适配官方脚本对同一输入连续执行 30 次的复用模式 | 一次性流式消费场景可能不受益 |
 | `767c220` | 使用 `desc.GetDataPtr()` 复用 `GetDesc` 已解析的数据指针 | 每核、每输入减少一次 TensorList 指针 GM 读取 | 预期主要改善小数据或多输入的 Scalar 开销 |
 | `b041908` | 对齐行在 UB 内拼接多个输入后整批连续写回 | 将每批行的 MTE3 次数从输入数降为 1 | 仅用于行调度、最多 16 输入、整行不超过 tile 的全对齐场景 |
+| `b2ecea2` | 保留输入默认缓存，仅让输出绕过 L2 | 避免 30 轮新输出挤占复用输入的缓存 | 可能降低 MTE3 写带宽，并损失下游输出复用 |
 
 ### 首轮 NPU 反馈与原因分析
 
@@ -165,7 +169,8 @@ DMA 或调度，只减少每核、每输入一次元数据 GM 访问。
 `r * outputRowBytes + sum(segmentBytes_j, j < i)`。单批最多 64 KiB，普通 `DataCopy`
 的 block length、block count 和 stride 均不会越过当前 910B 路径的字段范围。非对齐、
 超过 16 个输入、超大行及 chunk schedule 完整回退到已有实现。该优化与 CANN 8.5
-内置 Concat 的“多个输入组装到同一 UB 后合并写回”策略一致，但性能仍需在 910B 上实测。
+内置 Concat 的“多个输入组装到同一 UB 后合并写回”策略一致。当前累计版本已在 910B
+官方系统通过精度并获得净收益，但仍需隔离提交才能严格区分它与指针复用各自的贡献。
 
 ### 下一轮实验：仅输出绕过 L2
 
@@ -286,7 +291,7 @@ PERF_RESULT name=<case> samples=20 median_us=<time> min_us=<time> max_us=<time>
 
 ```bash
 git log --oneline -12
-# 算子代码基线应包含 b041908、767c220 和 75eec09
+# 本轮待测算子代码基线应为 b2ecea2
 
 bash build.sh
 # 按比赛环境原有流程安装 custom_*.run，运行精度与五个性能样例
@@ -304,9 +309,10 @@ times_us: <case1>, <case2>, <case3>, <case4>, <case5>
 
 本地测试优先回传 `row_aligned`、`many_inputs` 和 `ref`；其中 `row_aligned` 直接覆盖
 `b041908` 新路径，`many_inputs` 观察动态列表元数据开销，`ref` 对应已知 Case2 的
-`[128, 256]` FP16 非对齐随机分片。官方系统下一次提交应记录算子代码基线 `b041908`。
-若精度或性能回退，可先测试 `767c220` 隔离 UB 融合路径，再测试 `75eec09` 复现本轮
-`589.168 us` 结果。
+`[128, 256]` FP16 非对齐随机分片。本轮修改了本地 C++ 测试封装，需要重新执行一次
+`bash local_test/run.sh all --build`。官方系统下一次提交应记录算子代码基线 `b2ecea2`。
+若性能回退，先测试 `b041908` 隔离输出 L2 策略；若还需隔离前一轮，再测试 `767c220`
+排除 UB 融合路径，最后用 `75eec09` 复现 `589.168 us` 结果。
 
 更早的累计版本顺序为：
 
