@@ -91,6 +91,9 @@ Concat 不做数值计算，Kernel 使用 `uint8_t` 原始字节搬运统一覆�
 | `98cc5f6` | 将 Host 片段长度预加载范围从 16 扩展到 32 | 覆盖 17～32 输入的常见动态列表边界 | Tiling 数据增大；需验证中等输入数是否受益 |
 | `f3aa07d` | 大型全对齐输出行重新启用 tile 融合，但按核连续分配 tile 并递增维护输入边界 | 在大行场景减少 MTE3 写回，同时消除上一版逐 tile 重复前缀扫描 | 高风险；仅输出至少 8 个 tile 时启用，需优先检查精度和 Case5 |
 | `0189f03` | 在 `local_test` 增加输入数、零长度、Rank4 首轴和 tile 尾块边界 Case | 快速暴露预加载上下限、零片段和二维地址错误 | 本地诊断不代表官方隐藏样例 |
+| `375a67a` | 本地结果增加均值，并自动生成包含 commit 和所有 Case 的 Markdown 简表 | 固化同环境比较口径，避免手工转录和版本标签歧义 | HEAD 默认代表源码；测试旧安装包时需显式传实际 commit |
+| `8dc7a78` | 显式回退 `f3aa07d`，保留 32 输入预加载 | 隔离第二次 mode 2 负反馈 | 32 输入扩展仍需单独上板归因 |
+| `9f07f4a` | 在保持活跃核数时将普通搬运 tile 扩展到 96 KiB，并保留 64/32 KiB 回退 | 利用 910B 的 192 KiB UB，减少大流式 Case 的 DMA 和循环次数 | 两个 96 KiB Buffer 用满 UB；必须验证 Kernel 编译、阈值和大数据性能 |
 
 ### 首轮 NPU 反馈与原因分析
 
@@ -358,6 +361,26 @@ mode 2。若当时确实运行当前累计二进制，这两个约 `17%` 的回�
 输入切换和对多个 GM 源的交错读取未能被摊薄。下一实验不再修改输出区间映射，而是在保持活跃
 AIV 数的前提下扩大普通 row/chunk 路径单次 UB/DMA 搬运块，直接针对 Case5 的大规模流式搬运。
 
+### 下一轮实验：自适应 96 KiB 搬运块
+
+提交 `8dc7a78` 已用新的 Git revert 提交删除 `f3aa07d` 的全部 mode 2 Host/Kernel 代码，
+`98cc5f6` 的 32 输入元数据预加载保持不变。提交 `9f07f4a` 随后把普通 row/chunk 路径可选
+最大 tile 从 64 KiB 提升为 96 KiB。Ascend 910B 的 UB 为 192 KiB，当前绑定队列使用两个
+Buffer，因此 `2 x 96 KiB` 恰好覆盖全部 UB；Kernel 的地址公式、输入遍历顺序、DMA 类型和
+双 Buffer 数量均未改变。
+
+Host 同时计算 32/64/96 KiB 下的工作项数，并选择不损失活跃 AIV 的最大块：outer 行本身已
+填满核或 96 KiB chunk 数能填满核时选择 96 KiB；否则若 64 KiB 能填满核则选择 64 KiB；
+再否则保留 32 KiB。这样避免在占用率临界形状上为了减少 DMA 次数而丢失并行度。新本地 Case
+`tile_medium_occupancy` 使用单个 3 MiB 片段，在 40/48 核上只能选择 64 KiB；
+`tile_large_occupancy` 使用单个 4.6875 MiB 片段，可选择 96 KiB。两者用于检查阈值和单大段
+流式吞吐，不与官方隐藏 Case 直接对应。
+
+该实验风险高于原 64 KiB：队列没有 UB 余量，虽然本机 CANN 8.5 的 910B 内置算子也将
+192 KiB 作为可用 UB 上限，但当前环境未完成 Kernel 编译。若构建阶段报告 UB 分配失败，或
+`tile_large_occupancy/chunk_aligned/Case5` 明显回退，应新建 revert 提交撤销 `9f07f4a`；
+此时 `8dc7a78` 是仅保留 32 输入预加载的隔离点。
+
 ### 下一轮实验：复用 Host 预加载的片段字节数
 
 提交 `2c97dca` 使用当前 Host 已写入 Tiling 的前 16 个输入 `segmentBytes`。此前普通
@@ -436,6 +459,8 @@ bash build.sh
 | `max_inputs` | ACLNN 256 输入上限的描述符回退路径 |
 | `rank4_axis0` | Rank4 首轴拼接、负/正轴地址模型和零长度片段 |
 | `tile_tail` | 输出行跨越 64 KiB tile 且存在非整 tile 尾块 |
+| `tile_medium_occupancy` | 单个 3 MiB 片段，验证 96 KiB 不足以填核时回退 64 KiB |
+| `tile_large_occupancy` | 单个 4.6875 MiB 片段，验证 96 KiB 双 Buffer 的大流式吞吐 |
 
 测试工具所需的 ACLNN/PyTorch NPU helper 已复制到
 `local_test/common/pytorch_npu_helper.hpp`，运行时不依赖 `test-ref/`，整个
@@ -453,6 +478,19 @@ bash local_test/run.sh all --build
 bash local_test/run.sh all
 # 也可只跑一个分支，例如：
 bash local_test/run.sh ref
+```
+
+`get_time.py` 对预热后的 20 个样本同时输出中位数、算术均值、最小值和最大值。每个成功 Case
+会保存到 `local_test/results/<commit>/<case>.txt`；运行单 Case 或 `all` 后，脚本自动生成
+`local_test/results/<commit>/summary.md`，并复制为便于查看的
+`local_test/results/latest.md`。简表包含逐 Case 的 `median/mean/min/max`，以及所有已完成
+Case 的 median 合计和 mean 合计。该目录是机器生成产物，已加入 `.gitignore`。
+
+默认 commit 来自运行时源码 HEAD。若当前安装的自定义算子包由另一个 commit 构建，应显式
+标注真实代码版本，避免再次出现源码标签与二进制不一致：
+
+```bash
+CONCAT_CODE_COMMIT=<installed-op-commit> bash local_test/run.sh all
 ```
 
 ### 测试扩展兼容性修复
@@ -536,7 +574,7 @@ bash local_test/run.sh fused_tiles
 
 ```text
 CASE_RESULT name=<case> correctness=pass
-PERF_RESULT name=<case> samples=20 median_us=<time> min_us=<time> max_us=<time>
+PERF_RESULT name=<case> samples=20 median_us=<time> mean_us=<time> min_us=<time> max_us=<time>
 ```
 
 此环境没有 NPU，因此上述测试脚本只完成源代码和 Shell 静态检查，未在本机实际执行。
@@ -547,7 +585,7 @@ PERF_RESULT name=<case> samples=20 median_us=<time> min_us=<time> max_us=<time>
 
 ```bash
 git log --oneline -12
-# 当前待测版本包含 32 输入以内的元数据预加载，并对 >=8 tile 的大行启用受限 mode 2
+# 当前待测版本保留 32 输入预加载、删除 mode 2，并自适应选择 32/64/96 KiB tile
 
 bash build.sh
 # 按比赛环境原有流程安装 custom_*.run，运行精度与五个性能样例
@@ -563,12 +601,13 @@ correctness: pass|fail
 times_us: <case1>, <case2>, <case3>, <case4>, <case5>
 ```
 
-本地测试优先回传 `ref`、`preload_16`、`preload_17`、`fused_tiles`、`tile_tail` 和
-`max_inputs`；其中 `ref` 对应已知 Case2 的 `[128, 256]` FP16、9 个非对齐随机片段，
-`preload_16/17` 覆盖新边界，`fused_tiles/tile_tail` 覆盖受限 mode 2，`max_inputs` 覆盖
-描述符回退。测试扩展已构建时无需因 Python case 改动执行 `--build`。下一轮官方结果必须
-与默认缓存基线 `578.9805 us` 比较；若 `f3aa07d` 回退，先新建回退提交恢复 `98cc5f6`，
-再按需隔离 `2c97dca`。更早的 `d6a5a57` 仍是完全删除 mode 2 的稳定恢复点。
+本地测试优先回传 `ref`、`preload_16`、`preload_17`、`chunk_aligned`、
+`tile_medium_occupancy`、`tile_large_occupancy` 和 `max_inputs`；其中 `ref` 对应已知 Case2 的
+`[128, 256]` FP16、9 个非对齐随机片段，`preload_16/17` 覆盖元数据边界，三个大段 Case
+覆盖 32/64/96 KiB tile 选择，`max_inputs` 覆盖描述符回退。测试扩展已构建时无需因 Python
+Case 改动执行 `--build`。当前 `9f07f4a` 应与本轮官方 `574.7515 us` 和此前最好
+`573.612 us` 同时比较；若 96 KiB 回退，先新建 revert 提交撤销 `9f07f4a`，所得版本即
+`8dc7a78` 的“32 输入预加载、无 mode 2”隔离方案。
 
 更早的累计版本顺序为：
 
