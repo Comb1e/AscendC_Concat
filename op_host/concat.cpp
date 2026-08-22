@@ -12,7 +12,6 @@ namespace {
 constexpr uint32_t kSmallTileBytes = 32U * 1024U;
 constexpr uint32_t kLargeTileBytes = 64U * 1024U;
 constexpr uint32_t kFallbackVectorCores = 40U;
-constexpr uint32_t kTileFusionMinTiles = 8U;
 
 bool NormalizeDim(int64_t rawDim, size_t rank, uint32_t& dim)
 {
@@ -110,22 +109,7 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
     const uint64_t chunkCoreCount = std::min<uint64_t>(maxCoreCount, chunkWorkItems);
     // Keep the lower-overhead row path unless chunking activates more AIV cores.
     const bool rowSchedule = chunkCoreCount <= rowCoreCount;
-    uint32_t tilingScheduleMode = rowSchedule ? 0U : 1U;
-    uint64_t workItems = rowSchedule ? rowWorkItems : chunkWorkItems;
-
-    // Large aligned rows amortize the extra input-boundary walk needed to assemble
-    // one output tile. Smaller rows retain the lower-control-overhead paths above.
-    if (inputCount <= optiling::kPreloadedSegmentCount && allSegmentsAligned &&
-        outputRowBytes >= static_cast<uint64_t>(tileBytes) * kTileFusionMinTiles) {
-        const uint64_t fusedChunksPerOuter = (outputRowBytes + tileBytes - 1) / tileBytes;
-        const uint64_t fusedWorkItems = outerSize * fusedChunksPerOuter;
-        const uint64_t fusedCoreCount = std::min<uint64_t>(maxCoreCount, fusedWorkItems);
-        const uint64_t selectedCoreCount = rowSchedule ? rowCoreCount : chunkCoreCount;
-        if (fusedCoreCount >= selectedCoreCount) {
-            tilingScheduleMode = 2U;
-            workItems = fusedWorkItems;
-        }
-    }
+    const uint64_t workItems = rowSchedule ? rowWorkItems : chunkWorkItems;
     const uint32_t blockDim = static_cast<uint32_t>(
         std::max<uint64_t>(1, std::min<uint64_t>(maxCoreCount, workItems)));
 
@@ -135,7 +119,7 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
     tiling.set_inputCount(static_cast<uint32_t>(inputCount));
     tiling.set_concatDim(concatDim);
     tiling.set_elementBytes(static_cast<uint32_t>(dtypeBytes));
-    tiling.set_scheduleMode(tilingScheduleMode);
+    tiling.set_scheduleMode(rowSchedule ? 0U : 1U);
     tiling.set_tileBytes(tileBytes);
     tiling.set_allSegmentsAligned(allSegmentsAligned ? 1U : 0U);
     tiling.set_segmentBytes(preloadedSegmentBytes);
