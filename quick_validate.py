@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Fast host-side checks for the staged Gather concat path.
+"""Fast host-side checks for concat experiments and local test definitions.
 
-This script does not execute an NPU kernel. It checks source invariants, models
-UB/GM addresses for selected local cases and randomized boundaries, and parses
-the local test scripts. Pass --build to also run the repository's offline build.
+This script does not execute an NPU kernel. When the staged Gather experiment is
+enabled it checks its source invariants and UB/GM address model. The model remains
+available as a regression reference after that experiment is reverted. It also
+parses the local test scripts. Pass --build to run the repository's offline build.
 """
 
 from __future__ import annotations
@@ -213,8 +214,13 @@ def validate_compact_addresses(case: CompactShape) -> tuple[int, int, int]:
     return staging_row_bytes, batch_rows, offset_buffer_bytes + batch_rows * bytes_per_batch_row
 
 
-def validate_kernel_source() -> None:
+def validate_kernel_source() -> bool:
     source = (ROOT / "op_kernel" / "concat.cpp").read_text(encoding="utf-8")
+    gather_enabled = "ProcessFusedUnalignedRows" in source
+    if not gather_enabled:
+        require("tilingData.scheduleMode == 2" not in source, "partial staged Gather dispatch remains")
+        return False
+
     stride_formula = re.compile(
         r"destinationStrideBlocks\s*=\s*"
         r"\(tilingData\.stagingRowBytes\s*-\s*alignedSegmentBytes\)\s*/\s*kDataBlockBytes\s*;"
@@ -225,6 +231,7 @@ def validate_kernel_source() -> None:
     )
     require(stride_formula.search(source) is not None, "kernel UB dstStride is not in datablocks")
     require(copy_params.search(source) is not None, "staging copy does not use destinationStrideBlocks")
+    return True
 
 
 def validate_known_cases() -> None:
@@ -301,8 +308,11 @@ def main() -> int:
     args = parser.parse_args()
     require(args.random_cases >= 0, "--random-cases must be nonnegative")
 
-    validate_kernel_source()
-    print("KERNEL_SOURCE staged_ub_stride=datablocks status=pass")
+    gather_enabled = validate_kernel_source()
+    if gather_enabled:
+        print("KERNEL_SOURCE staged_gather=enabled staged_ub_stride=datablocks status=pass")
+    else:
+        print("KERNEL_SOURCE staged_gather=disabled status=pass")
     validate_known_cases()
     validate_random_cases(args.random_cases, args.seed)
     validate_test_syntax()
