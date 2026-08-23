@@ -43,8 +43,9 @@ Host 已下发 bounded 输入的精确片段长度时，Kernel 应直接复用�
 `skill-creator` 的 `quick_validate.py` 校验。本轮新增经验是：动态输入的 chunk 调度应同时统计
 `coreCount * inputCount` 级别的描述符触达、Tiling 体积和隐藏形状分布；专门构造的 256 输入
 本地 Case 即使大幅受益，也不能证明 Host 大数组预分区适合作为通用默认路径。910B 上的
-staging + `Gather` 还必须逐项核对 Ext DMA stride 的字节单位、所有 Vector UB 起点的 32B
-对齐和 Scalar/Vector 流水依赖；静态地址模型与离线编译均通过，仍不能证明设备指令安全。
+staging + `Gather` 还必须按操作数所在存储位置逐项核对 Ext DMA stride 单位：GM 侧为字节，
+UB 侧为 32B datablock；同时核对所有 Vector UB 起点的 32B 对齐和 Scalar/Vector 流水依赖。
+静态地址模型与离线编译均通过，仍不能证明设备指令安全。
 出现 AIVEC/MTE 异常时应先建立精确 revert 点，再用最小本地 Case 验证修正版，不能直接提交
 官方测试。
 
@@ -111,8 +112,9 @@ Concat 不做数值计算，Kernel 使用 `uint8_t` 原始字节搬运统一覆�
 | `1d9435c` | 非对齐 FP16/FP32 小行使用 staging UB + `Gather` 压紧并批量写回 | 将每批 MTE3 命令从输入数降为 1，直接针对未优化的非对齐整行场景 | 本地与官方 Case1 触发 AIVEC/MTE 异常，已判负并撤销 |
 | `3988b0f` | 增加 Gather 命中、DType 回退、8 KiB 阈值和零长度输入边界 Case | 快速验证新 schedule 的正确性与收益来源 | 本地结果仍不对应官方隐藏 Case |
 | `9d82f80` | 显式撤销 `1d9435c` | 从设备异常版本恢复可运行源码 | 三个算子源码文件与历史最优 `2c97dca` 完全一致 |
-| `d8ebf9c` | 修正 staging Ext DMA 的字节 stride，并用对齐 Vector 块与 Scalar 边界生成 Gather offset | 保留结构性收益假设，同时消除已定位的 MTE/Vector 非法参数 | 910B 离线编译通过，仍必须先做本地精度门禁 |
+| `d8ebf9c` | 用对齐 Vector 块与 Scalar 边界生成 Gather offset，并把 staging UB `dstStride` 改为字节 gap | 尝试消除首轮 Vector/MTE 异常 | offset 生成方向合理，但 UB stride 单位改错；`row_unaligned` 实机 MTE 写越界，已判负 |
 | `cb1c4c5` | 增加 offset 对齐、非对齐输出尾行和单 batch 三个诊断 Case | 分离 offset 生成、MTE3 自动补齐与 `blockCount=1` 行为 | 只增加测试，不改变算子二进制 |
+| `e9a0c27` | 将 staging GM→UB 的目的 stride 恢复为 32B datablock 数 | 保留 offset 对齐修复，同时修复多行 staging MTE 写越界 | 910B 四种 DType 离线构建通过，待 NPU 最小精度门禁 |
 
 ### 首轮 NPU 反馈与原因分析
 
@@ -578,7 +580,7 @@ Case1/2 的 `2.484/8.424 us` 回退远大于前几轮小 Case 的普通波动，
 - [DataCopyPad 参数与非对齐 dummy 规则](https://www.hiascend.com/document/detail/zh/canncommercial/81RC1/apiref/ascendcopapi/atlasascendc_api_07_0265.html)
 - [Compact 模式的产品限制](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/900beta2/opdevg/Ascendcopdevg/atlas_ascendc_best_practices_10_00017.html)
 
-### `1d9435c` 的设备异常、回退与修正重试
+### `1d9435c`、`d8ebf9c` 的设备异常与第二次修正
 
 提交 `1a3d26d`、`4c8e8de`、`f5635b6`、`84a2755` 依次撤销 Host chunk 预分区、两项 chunk
 均衡逻辑和 32 输入预加载。完成后三个算子源码文件与历史最好 `2c97dca` 无差异。随后
@@ -599,33 +601,47 @@ Case2 至 Case5 通过就断言它们都走了回退路径；但 Case1 已足以
 本地运行也在 AIV core 0 报 `error code=0`，PC 位于 Kernel 起点后 `0x3d8`，同时出现
 `vec error info=0x10000009c` 和 `mte error info=0xf50300001e`。错误掩码包含
 `mte_gdma_illegal_burst_num` 线索，但一次设备异常会级联置位多个子错误，不能只按该位推断
-唯一根因。源码与 CANN 8.5 的 910B 实现逐项对照后确认了两处实际错误：
+唯一根因。首轮源码中可以确认的非法行为是 offset 表按输入分段调用 `ArithProgression`。
+`ref` 第一段有 27 个 FP16 元素，第二段从 offset 表的 `27 * 4 = 108B` 位置开始；当 API
+内部转为 Vector `Adds` 时，其数据块起点并非 32B 对齐，而且连续多次高级 API 还混合 Scalar
+与 Vector 写同一 TBuf，静态字节模型无法检出该流水依赖。
 
-- `DataCopyExtParams` 的 Ext stride 以字节为单位；原 staging 搬运却把
-  `stagingRowBytes - alignedSegmentBytes` 除以 32。以本地 `ref` 第一段为例，正确 gap 为
-  `608B`，原代码下发 `19B`，下一行 UB 起点因此不再 32B 对齐，可直接触发 MTE 异常。
-- offset 表按输入分段调用 `ArithProgression`。`ref` 第一段有 27 个 FP16 元素，第二段从
-  offset 表的 `27 * 4 = 108B` 位置开始；当 API 内部转为 Vector `Adds` 时，其数据块起点并非
-  32B 对齐，而且连续多次高级 API 还混合 Scalar 与 Vector 写同一 TBuf，静态字节模型无法
-  检出该流水依赖。
+上一轮曾把 staging 的 Ext `dstStride` 也判为错误，认为 Ext 结构体中的 stride 一律以字节
+为单位。该结论不正确，现已根据 CANN 8.5 的 910B 实现和官方 `DataCopyPad` 参数表更正：
+
+- `blockLen` 的单位是字节；
+- stride 的单位取决于对应操作数的位置，而不是 Ext/非 Ext 结构体；
+- GM 操作数的 stride 单位是字节，VECIN/VECOUT 操作数的 stride 单位是 32B datablock；
+- 因此 GM→UB staging 搬运的 `srcStride` 是字节，而 `dstStride` 必须是 datablock 数。
+
+原 `1d9435c` 将 UB gap 除以 32 的做法在单位上实际正确；不能再把它列为首轮设备异常的已证
+根因。官方参数说明见 [CANN 8.5 DataCopyPad](https://www.hiascend.com/document/detail/zh/canncommercial/850/API/ascendcopapi/atlasascendc_api_07_0265.html)。
 
 批量 UB 到 GM 写回的 `srcStride=0` 经 910B 实现核对是正确的：MTE 会按 32B 对齐后的
 `blockLen` 推进 UB 源地址，不应再额外跳过一次 padding。提交 `9d82f80` 已完整撤销
 `1d9435c`；再次比较确认三个算子源码与 `2c97dca` 完全相同，形成可运行的精确恢复点。
 
-提交 `d8ebf9c` 从该恢复点重新实现同一高收益假设，但只修正已定位的设备约束：
+提交 `d8ebf9c` 从该恢复点重新实现同一高收益假设：
 
-- staging 的 `dstStride` 直接下发字节 gap；
 - offset TBuf 额外保留一个 32B seed block，完整的 8 个 `int32` offset 块只从 32B 对齐地址
   使用 `Adds` 生成；每个输入两端不足一块的 offset 用 Scalar `SetValue` 补齐；
 - Vector 主体和 Scalar 边界之间显式使用 `S_V`、`V_S` 事件，Gather 前再次完成 `S_V` 同步；
 - INT8、超过 16 输入、超过 8 KiB 输出行、全对齐行和 chunk schedule 继续保持历史路径。
 
-修正版已用 CANN 8.5 完整生成四种 DType 的 Ascend 910B Kernel，并成功链接 Host/ACLNN 库和
-打包自定义算子。离线编译不执行设备指令，因此 `d8ebf9c` 仍是高风险 NPU 实验，必须先通过
-本地 `ref`、`compact_offset_aligned`、`compact_output_tail` 和 `compact_batch_one`，再考虑
-官方测试。若任一 Case 再次触发设备异常，应停止当前 NPU 上下文并 `git revert d8ebf9c`，保留
-`cb1c4c5` 的诊断 Case，不能继续在失败二进制上叠加性能改动。
+但该提交同时把 staging UB `dstStride` 从 datablock 数改成了字节 gap。本地
+`row_unaligned` 随即在全部 40 个逻辑 block 的同一 PC `+0xa38` 触发 AIVEC 异常，设备明确报告
+`The write address of the MTE instruction is out of range`。该 Case 的输出行是 514B，staging
+行是 704B；每核最多处理 26 行，因此 staging 队列只分配 `26 * 704 = 18304B`。第一段为
+54B，UB 中占 64B，正确的 `dstStride` 是 `(704 - 64) / 32 = 20` 个 datablock；`d8ebf9c`
+却下发 `640`，硬件将其解释为 `640 * 32 = 20480B` 的间隔，第二个 burst 的 UB 写地址已经
+超出队列。该计算与全部 block 在同一 MTE 指令失败完全一致。
+
+批量 UB→GM 写回的 `srcStride=0` 仍然正确：源位于 UB，硬件会按对齐后的 32B footprint 推进；
+目的位于 GM，`dstStride=0` 表示输出行紧密连续。提交 `e9a0c27` 只把 staging 目的 gap 改回
+`(stagingRowBytes - alignedSegmentBytes) / 32`，保留 `d8ebf9c` 的 offset 对齐与流水同步修复。
+修正后已用 CANN 8.5 完整生成 FP16、FP32、INT8、INT32 四份 Ascend 910B Kernel，并成功链接
+Host/ACLNN 库和打包自定义算子。离线编译不执行设备指令，因此 `e9a0c27` 仍必须先通过单行
+Gather 与 `row_unaligned` 多行 stride 两级 NPU 精度门禁，不能直接提交官方测试。
 
 ### 历史实验：复用 Host 预加载的片段字节数
 
@@ -680,10 +696,10 @@ bash build.sh
 成功后应在 `build_out/` 中得到 `custom_*.run`。构建脚本会重新生成 `.build/`，因此不要在该目录保存手工修改。
 
 本次开发环境没有 NPU。为避免系统默认 Python 3.13 缺少 CANN 依赖，本机将 CANN Python 3.9、
-`opc` 和 `ccec_compiler` 放到 `PATH` 后执行 `bash build.sh`。`d8ebf9c` 的 FP16、FP32、INT8、
+`opc` 和 `ccec_compiler` 放到 `PATH` 后执行 `bash build.sh`。`e9a0c27` 的 FP16、FP32、INT8、
 INT32 四份 Ascend 910B Kernel 均生成成功，Host tiling、算子原型和 ACLNN 库均链接成功，最终
 包为 `build_out/custom_opp_ubuntu_x86_64.run`；对最终 `.run` 文件执行 `sha256sum` 得到
-`3af1a3b15397e1244c9161763bb1a006ce48d1bb899322125aaef74463df6f19`。无 NPU 环境中的
+`d50e6c1ebf947c8eddf2c61dd7577e450e659d8e983ce621895564d7686ef21e`。无 NPU 环境中的
 `get platform info failed, drvErr=4` 不影响离线 `opc` 生成，但完整构建通过仍不等于设备运行
 正确，当前 Gather 修正版尚未经过 NPU 精度验证。
 
@@ -839,40 +855,42 @@ PERF_RESULT name=<case> samples=20 median_us=<time> mean_us=<time> min_us=<time>
 
 ## NPU 验证
 
-先构建并安装当前累计版本。算子源码提交是 `d8ebf9c`，HEAD 还包含只修改本地测试的
-`cb1c4c5`：
+先构建并安装当前累计版本。算子源码提交是 `e9a0c27`，其前一提交 `cb1c4c5` 只增加本地
+诊断 Case：
 
 ```bash
 git log --oneline -12
-# d8ebf9c：修正 stride 单位和 offset 对齐的 staging + Gather 重试
-# cb1c4c5：只增加本地诊断 Case
+# e9a0c27：修复 staging GM->UB 的 UB datablock stride
+# d8ebf9c：offset 对齐修复；其字节 dstStride 已由 e9a0c27 更正
 
 bash build.sh
 # 按比赛环境原有流程安装 custom_*.run，运行精度与五个性能样例
 ```
 
-安装后必须逐个运行分支隔离用例；测试扩展已经构建时不需要再次传 `--build`。若前四项任一
-出现 AIVEC/MTE 异常，立即停止，不要继续执行 `all` 或提交官方测试：
+发生过 AIVEC 异常的设备应先按比赛环境流程恢复为可正常运行状态，再安装新包并启动全新测试
+进程。测试扩展已经构建时不需要再次传 `--build`。先运行每核单行 Case，验证 Gather offset
+与流水；再运行原始复现 Case，验证多行 staging stride。若任一项出现 AIVEC/MTE 异常，立即
+停止，不要继续执行 `all` 或提交官方测试：
 
 ```bash
-CONCAT_CODE_COMMIT=d8ebf9c bash local_test/run.sh ref
-CONCAT_CODE_COMMIT=d8ebf9c bash local_test/run.sh compact_offset_aligned
-CONCAT_CODE_COMMIT=d8ebf9c bash local_test/run.sh compact_output_tail
-CONCAT_CODE_COMMIT=d8ebf9c bash local_test/run.sh compact_batch_one
-CONCAT_CODE_COMMIT=d8ebf9c bash local_test/run.sh compact_zero_segments
-CONCAT_CODE_COMMIT=d8ebf9c bash local_test/run.sh row_unaligned
-CONCAT_CODE_COMMIT=d8ebf9c bash local_test/run.sh row_unaligned_fp32
-CONCAT_CODE_COMMIT=d8ebf9c bash local_test/run.sh compact_limit
-CONCAT_CODE_COMMIT=d8ebf9c bash local_test/run.sh compact_over_limit
-CONCAT_CODE_COMMIT=d8ebf9c bash local_test/run.sh row_unaligned_int8
-CONCAT_CODE_COMMIT=d8ebf9c bash local_test/run.sh row_aligned
+CONCAT_CODE_COMMIT=e9a0c27 bash local_test/run.sh compact_batch_one
+CONCAT_CODE_COMMIT=e9a0c27 bash local_test/run.sh row_unaligned
+CONCAT_CODE_COMMIT=e9a0c27 bash local_test/run.sh compact_offset_aligned
+CONCAT_CODE_COMMIT=e9a0c27 bash local_test/run.sh compact_output_tail
+CONCAT_CODE_COMMIT=e9a0c27 bash local_test/run.sh ref
+CONCAT_CODE_COMMIT=e9a0c27 bash local_test/run.sh compact_zero_segments
+CONCAT_CODE_COMMIT=e9a0c27 bash local_test/run.sh row_unaligned_fp32
+CONCAT_CODE_COMMIT=e9a0c27 bash local_test/run.sh compact_limit
+CONCAT_CODE_COMMIT=e9a0c27 bash local_test/run.sh compact_over_limit
+CONCAT_CODE_COMMIT=e9a0c27 bash local_test/run.sh row_unaligned_int8
+CONCAT_CODE_COMMIT=e9a0c27 bash local_test/run.sh row_aligned
 ```
 
 性能测试应先预热，再在相同环境重复运行并取中位数。请同时记录精度结果、SoC/CANN 版本和 commit：
 
 ```text
 commit: <git rev-parse --short HEAD 的输出>
-code_baseline: <算子源码 commit；当前为 d8ebf9c>
+code_baseline: <算子源码 commit；当前为 e9a0c27>
 soc/cann: <version>
 correctness: pass|fail
 times_us: <case1>, <case2>, <case3>, <case4>, <case5>
@@ -881,7 +899,7 @@ times_us: <case1>, <case2>, <case3>, <case4>, <case5>
 本地测试优先回传上述 11 项的正确性与 `median/mean/min/max`。测试扩展已构建时无需因 Python
 Case 改动执行 `--build`。当前官方主要比较点是历史最好 `573.612 us`；`1d9435c` 因 Case1
 Run failed 没有合法总分。若修正版仍有设备异常或 FP16/FP32 小行明显回退，新建 revert 提交撤销
-`d8ebf9c` 即可恢复 `9d82f80`/`2c97dca` 的算子源码，同时保留新增测试。
+`e9a0c27` 后再撤销 `d8ebf9c`，即可恢复 `9d82f80`/`2c97dca` 的算子源码，同时保留新增测试。
 
 更早的累计版本顺序为：
 
