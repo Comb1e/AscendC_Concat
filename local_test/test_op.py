@@ -145,6 +145,24 @@ CASES = {
         "dim": -1,
         "splits": [65536, 4464],
     },
+    "pipeline_one_loop": {
+        "shape": (40, 65536),
+        "dtype": torch.int8,
+        "dim": 0,
+        "splits": [40],
+    },
+    "pipeline_two_loops": {
+        "shape": (80, 65536),
+        "dtype": torch.int8,
+        "dim": 0,
+        "splits": [80],
+    },
+    "pipeline_eight_loops": {
+        "shape": (320, 65536),
+        "dtype": torch.int8,
+        "dim": 0,
+        "splits": [320],
+    },
 }
 
 
