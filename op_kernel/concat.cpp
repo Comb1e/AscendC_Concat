@@ -30,6 +30,14 @@ __aicore__ inline uint64_t LoadInput(ListTensorDesc& inputs, uint32_t inputIdx,
         return segmentBytes;
     }
 
+    if (tilingData.allSegmentsSame != 0) {
+        const uint64_t segmentBytes = tilingData.uniformSegmentBytes;
+        if (segmentBytes != 0) {
+            source.SetGlobalBuffer(inputs.GetDataPtr<uint8_t>(inputIdx));
+        }
+        return segmentBytes;
+    }
+
     uint64_t shapeBuffer[kMaxRank];
     TensorDesc<uint8_t> desc;
     desc.SetShapeAddr(shapeBuffer);

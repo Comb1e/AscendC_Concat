@@ -64,6 +64,8 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
     uint64_t largeChunksPerOuter = 0;
     uint64_t preloadedSegmentBytes[optiling::kPreloadedSegmentCount] = {};
     bool allSegmentsAligned = true;
+    bool allSegmentsSame = true;
+    uint64_t uniformSegmentBytes = 0;
     for (size_t i = 0; i < inputCount; ++i) {
         const auto* storageShape = context->GetDynamicInputShape(0, i);
         if (storageShape == nullptr) {
@@ -81,6 +83,11 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
 
         const uint64_t segmentBytes = static_cast<uint64_t>(shape.GetDim(concatDim)) * innerSize *
                                       static_cast<uint64_t>(dtypeBytes);
+        if (i == 0) {
+            uniformSegmentBytes = segmentBytes;
+        } else {
+            allSegmentsSame = allSegmentsSame && segmentBytes == uniformSegmentBytes;
+        }
         if (i < optiling::kPreloadedSegmentCount) {
             preloadedSegmentBytes[i] = segmentBytes;
         }
@@ -116,12 +123,14 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
     ConcatTilingData tiling;
     tiling.set_outerSize(outerSize);
     tiling.set_outputRowBytes(outputRowBytes);
+    tiling.set_uniformSegmentBytes(uniformSegmentBytes);
     tiling.set_inputCount(static_cast<uint32_t>(inputCount));
     tiling.set_concatDim(concatDim);
     tiling.set_elementBytes(static_cast<uint32_t>(dtypeBytes));
     tiling.set_scheduleMode(rowSchedule ? 0U : 1U);
     tiling.set_tileBytes(tileBytes);
     tiling.set_allSegmentsAligned(allSegmentsAligned ? 1U : 0U);
+    tiling.set_allSegmentsSame(allSegmentsSame ? 1U : 0U);
     tiling.set_segmentBytes(preloadedSegmentBytes);
 
     context->SetBlockDim(blockDim);
