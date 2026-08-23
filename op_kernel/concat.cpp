@@ -5,6 +5,7 @@ using namespace AscendC;
 
 namespace {
 constexpr uint32_t kBufferCount = 2;
+constexpr uint32_t kQueueDepth = 1;
 constexpr uint32_t kMaxRank = 8;
 constexpr uint32_t kPreloadedSegmentCount = 16;
 constexpr uint32_t kDataBlockBytes = 32;
@@ -226,7 +227,7 @@ extern "C" __global__ __aicore__ void concat(
     outputTensor.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(output));
 
     TPipe pipe;
-    TQueBind<QuePosition::VECIN, QuePosition::VECOUT, kBufferCount> queue;
+    TQueBind<QuePosition::VECIN, QuePosition::VECOUT, kQueueDepth> queue;
     pipe.InitBuffer(queue, kBufferCount, tilingData.tileBytes);
 
     const bool fuseAlignedRows = tilingData.scheduleMode == 0 && tilingData.allSegmentsAligned != 0 &&
