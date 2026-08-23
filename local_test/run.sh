@@ -9,7 +9,7 @@ RESULT_ROOT="$SCRIPT_DIR/results"
 REPO_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
 CODE_COMMIT=${CONCAT_CODE_COMMIT:-$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)}
 RESULT_DIR="$RESULT_ROOT/$CODE_COMMIT"
-CASES=(ref row_unaligned row_unaligned_fp32 row_unaligned_int8 compact_limit compact_over_limit compact_zero_segments compact_offset_aligned compact_output_tail compact_batch_one row_aligned chunk_aligned fused_tiles many_inputs single_input zero_segments preload_16 preload_17 max_inputs rank4_axis0 tile_tail)
+CASES=(ref row_unaligned row_unaligned_fp32 row_unaligned_int8 compact_limit compact_over_limit compact_zero_segments compact_offset_aligned compact_output_tail compact_batch_one row_aligned chunk_aligned fused_tiles many_inputs single_input zero_segments preload_16 preload_17 max_inputs rank4_axis0 tile_tail pipeline_one_loop pipeline_two_loops pipeline_eight_loops)
 
 mkdir -p "$RESULT_DIR"
 
