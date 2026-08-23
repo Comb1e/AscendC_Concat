@@ -115,6 +115,7 @@ Concat 不做数值计算，Kernel 使用 `uint8_t` 原始字节搬运统一覆�
 | `d8ebf9c` | 用对齐 Vector 块与 Scalar 边界生成 Gather offset，并把 staging UB `dstStride` 改为字节 gap | 尝试消除首轮 Vector/MTE 异常 | offset 生成方向合理，但 UB stride 单位改错；`row_unaligned` 实机 MTE 写越界，已判负 |
 | `cb1c4c5` | 增加 offset 对齐、非对齐输出尾行和单 batch 三个诊断 Case | 分离 offset 生成、MTE3 自动补齐与 `blockCount=1` 行为 | 只增加测试，不改变算子二进制 |
 | `e9a0c27` | 将 staging GM→UB 的目的 stride 恢复为 32B datablock 数 | 保留 offset 对齐修复，同时修复多行 staging MTE 写越界 | 910B 四种 DType 离线构建通过，待 NPU 最小精度门禁 |
+| `6c4c10d` | 根目录增加 staged Gather 快速验证脚本 | 在无 NPU 环境拦截 stride 单位、UB 足迹、offset 和脚本语法回归 | 静态模型不能替代设备执行 |
 
 ### 首轮 NPU 反馈与原因分析
 
@@ -704,6 +705,25 @@ INT32 四份 Ascend 910B Kernel 均生成成功，Host tiling、算子原型和 
 正确，当前 Gather 修正版尚未经过 NPU 精度验证。
 
 ## 本地快速测试
+
+仓库根目录的 `quick_validate.py` 不导入 PyTorch/CANN，也不需要 NPU。它通过 AST 读取
+`local_test/test_op.py` 中的关键 Case，检查当前 Kernel 是否把 staging UB `dstStride` 编码为
+datablock，复算 Gather offset、每个 burst 的 UB 起止地址、MTE3 源 footprint 和 160 KiB UB
+预算，并默认执行 20000 组随机边界模型以及所有本地 Python/Shell 脚本的语法检查：
+
+```bash
+python3 quick_validate.py
+
+# 增加随机覆盖量
+python3 quick_validate.py --random-cases 100000 --seed 20260823
+
+# 在上述快速检查后继续执行项目完整离线构建
+python3 quick_validate.py --build
+```
+
+脚本输出中的 `NPU_EXECUTION status=not-run` 是预期结果。它能验证源码中已知的单位与区间不变量，
+但不能执行 MTE/Gather 指令或证明 Scalar/Vector 流水在设备上正确；修改该高风险路径后仍需按
+后文顺序逐个运行 NPU Case。
 
 `local_test/` 根据 `test-ref/` 的比赛调用链编写，仍通过 `EXEC_NPU_CMD(aclnnConcat, ...)`
 调用本项目自定义算子。与官方封装一致，每轮重新分配输出；每个 Case 连续执行 30 次，
