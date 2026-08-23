@@ -12,15 +12,6 @@ namespace {
 constexpr uint32_t kSmallTileBytes = 32U * 1024U;
 constexpr uint32_t kLargeTileBytes = 64U * 1024U;
 constexpr uint32_t kFallbackVectorCores = 40U;
-constexpr uint32_t kDataBlockBytes = 32U;
-constexpr uint32_t kCompactUbBytes = 160U * 1024U;
-constexpr uint32_t kMaxCompactRowBytes = 8U * 1024U;
-constexpr uint32_t kMaxCopyRows = 4095U;
-
-uint64_t AlignUp(uint64_t value, uint64_t alignment)
-{
-    return (value + alignment - 1U) / alignment * alignment;
-}
 
 bool NormalizeDim(int64_t rawDim, size_t rank, uint32_t& dim)
 {
@@ -71,7 +62,6 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
     uint64_t outputRowBytes = 0;
     uint64_t smallChunksPerOuter = 0;
     uint64_t largeChunksPerOuter = 0;
-    uint64_t stagingRowBytes = 0;
     uint64_t preloadedSegmentBytes[optiling::kPreloadedSegmentCount] = {};
     bool allSegmentsAligned = true;
     for (size_t i = 0; i < inputCount; ++i) {
@@ -93,9 +83,6 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
                                       static_cast<uint64_t>(dtypeBytes);
         if (i < optiling::kPreloadedSegmentCount) {
             preloadedSegmentBytes[i] = segmentBytes;
-        }
-        if (inputCount <= optiling::kPreloadedSegmentCount && segmentBytes != 0) {
-            stagingRowBytes += AlignUp(segmentBytes, kDataBlockBytes);
         }
         outputRowBytes += segmentBytes;
         smallChunksPerOuter += (segmentBytes + kSmallTileBytes - 1) / kSmallTileBytes;
@@ -126,44 +113,15 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
     const uint32_t blockDim = static_cast<uint32_t>(
         std::max<uint64_t>(1, std::min<uint64_t>(maxCoreCount, workItems)));
 
-    uint32_t scheduleMode = rowSchedule ? 0U : 1U;
-    uint32_t alignedOutputRowBytes = 0;
-    uint32_t compactBatchRows = 0;
-    const bool compactRowsEligible =
-        rowSchedule && !allSegmentsAligned && inputCount <= optiling::kPreloadedSegmentCount &&
-        (dtypeBytes == 2 || dtypeBytes == 4) && outputRowBytes != 0 &&
-        outputRowBytes <= kMaxCompactRowBytes;
-    if (compactRowsEligible) {
-        const uint64_t alignedOutputBytes = AlignUp(outputRowBytes, kDataBlockBytes);
-        const uint64_t outputElements = outputRowBytes / static_cast<uint64_t>(dtypeBytes);
-        const uint64_t offsetBufferBytes =
-            AlignUp(outputElements * sizeof(uint32_t), kDataBlockBytes) + kDataBlockBytes;
-        const uint64_t bytesPerBatchRow = stagingRowBytes + alignedOutputBytes;
-        if (offsetBufferBytes < kCompactUbBytes && bytesPerBatchRow != 0) {
-            const uint64_t ubBatchRows = (kCompactUbBytes - offsetBufferBytes) / bytesPerBatchRow;
-            const uint64_t maxCoreRows = (outerSize + blockDim - 1U) / blockDim;
-            const uint64_t batchRows = std::min<uint64_t>(
-                kMaxCopyRows, std::min<uint64_t>(ubBatchRows, maxCoreRows));
-            if (batchRows != 0) {
-                scheduleMode = 2U;
-                alignedOutputRowBytes = static_cast<uint32_t>(alignedOutputBytes);
-                compactBatchRows = static_cast<uint32_t>(batchRows);
-            }
-        }
-    }
-
     ConcatTilingData tiling;
     tiling.set_outerSize(outerSize);
     tiling.set_outputRowBytes(outputRowBytes);
     tiling.set_inputCount(static_cast<uint32_t>(inputCount));
     tiling.set_concatDim(concatDim);
     tiling.set_elementBytes(static_cast<uint32_t>(dtypeBytes));
-    tiling.set_scheduleMode(scheduleMode);
+    tiling.set_scheduleMode(rowSchedule ? 0U : 1U);
     tiling.set_tileBytes(tileBytes);
     tiling.set_allSegmentsAligned(allSegmentsAligned ? 1U : 0U);
-    tiling.set_stagingRowBytes(static_cast<uint32_t>(stagingRowBytes));
-    tiling.set_alignedOutputRowBytes(alignedOutputRowBytes);
-    tiling.set_compactBatchRows(compactBatchRows);
     tiling.set_segmentBytes(preloadedSegmentBytes);
 
     context->SetBlockDim(blockDim);

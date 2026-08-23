@@ -15,9 +15,6 @@ BEGIN_TILING_DATA_DEF(ConcatTilingData)
     TILING_DATA_FIELD_DEF(uint32_t, scheduleMode);
     TILING_DATA_FIELD_DEF(uint32_t, tileBytes);
     TILING_DATA_FIELD_DEF(uint32_t, allSegmentsAligned);
-    TILING_DATA_FIELD_DEF(uint32_t, stagingRowBytes);
-    TILING_DATA_FIELD_DEF(uint32_t, alignedOutputRowBytes);
-    TILING_DATA_FIELD_DEF(uint32_t, compactBatchRows);
     TILING_DATA_FIELD_DEF_ARR(uint64_t, 16, segmentBytes);
 END_TILING_DATA_DEF;
 
