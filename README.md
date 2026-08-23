@@ -114,7 +114,7 @@ Concat 不做数值计算，Kernel 使用 `uint8_t` 原始字节搬运统一覆�
 | `9d82f80` | 显式撤销 `1d9435c` | 从设备异常版本恢复可运行源码 | 三个算子源码文件与历史最优 `2c97dca` 完全一致 |
 | `d8ebf9c` | 用对齐 Vector 块与 Scalar 边界生成 Gather offset，并把 staging UB `dstStride` 改为字节 gap | 尝试消除首轮 Vector/MTE 异常 | offset 生成方向合理，但 UB stride 单位改错；`row_unaligned` 实机 MTE 写越界，已判负 |
 | `cb1c4c5` | 增加 offset 对齐、非对齐输出尾行和单 batch 三个诊断 Case | 分离 offset 生成、MTE3 自动补齐与 `blockCount=1` 行为 | 只增加测试，不改变算子二进制 |
-| `e9a0c27` | 将 staging GM→UB 的目的 stride 恢复为 32B datablock 数 | 保留 offset 对齐修复，同时修复多行 staging MTE 写越界 | 910B 四种 DType 离线构建通过，待 NPU 最小精度门禁 |
+| `e9a0c27` | 将 staging GM→UB 的目的 stride 恢复为 32B datablock 数 | 保留 offset 对齐修复，同时修复多行 staging MTE 写越界 | NPU 精度和设备安全已验证，但官方总耗时 `586.496 us`，性能判负 |
 | `6c4c10d` | 根目录增加 staged Gather 快速验证脚本 | 在无 NPU 环境拦截 stride 单位、UB 足迹、offset 和脚本语法回归 | 静态模型不能替代设备执行 |
 
 ### 首轮 NPU 反馈与原因分析
@@ -642,7 +642,46 @@ Case2 至 Case5 通过就断言它们都走了回退路径；但 Case1 已足以
 `(stagingRowBytes - alignedSegmentBytes) / 32`，保留 `d8ebf9c` 的 offset 对齐与流水同步修复。
 修正后已用 CANN 8.5 完整生成 FP16、FP32、INT8、INT32 四份 Ascend 910B Kernel，并成功链接
 Host/ACLNN 库和打包自定义算子。离线编译不执行设备指令，因此 `e9a0c27` 仍必须先通过单行
-Gather 与 `row_unaligned` 多行 stride 两级 NPU 精度门禁，不能直接提交官方测试。
+Gather 与 `row_unaligned` 多行 stride 两级 NPU 精度门禁；后续本地与官方测试已完成该门禁，
+结果见下一节。
+
+### Gather 修正版的官方与本地结果
+
+`e9a0c27` 修正版在官方五个隐藏 Case 上均通过精度，说明 offset 对齐、流水同步以及 UB
+datablock stride 修正后，staging + Gather 路径已经能够安全执行。性能结果为：
+
+| Case | 历史最好 `2c97dca`/us | Gather 修正版/us | 差值/us | 变化率 |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 11.140 | 13.168 | +2.028 | +18.20% |
+| 2 | 32.4705 | 34.620 | +2.1495 | +6.62% |
+| 3 | 22.390 | 22.480 | +0.090 | +0.40% |
+| 4 | 103.653 | 106.016 | +2.363 | +2.28% |
+| 5 | 403.9585 | 410.212 | +6.2535 | +1.55% |
+| 合计 | 573.612 | 586.496 | +12.884 | +2.247% |
+
+五项全部慢于历史最好，不能把总回退解释成单个隐藏 shape 或普通抖动。与首轮设备失败的
+`1d9435c` 相比，修正版在 Case2 至 Case5 的可比小计降低 `7.344 us`，说明越界修复和新的
+offset 生成确实消除了异常版本的一部分额外成本；但该比较缺少 Case1，且仍未胜过
+`2c97dca`，不能据此保留新路径。
+
+`localtest.md` 中标记为 `5a64a3c` 的 21 项结果均通过按位精度检查，也给出了更强的机制级
+对照。与同环境历史最好 `2c97dca` 相比，`ref` 从 `10.620` 增至 `14.191 us`，增加
+`3.571 us`（`33.63%`）；直接命中 Gather 的 `row_unaligned` 从 `17.601` 增至
+`35.060 us`，增加 `17.459 us`（`99.19%`）。未命中该路径的 `row_aligned`、
+`chunk_aligned`、`fused_tiles` 和 `many_inputs` 变化仅约为 `+1.160/+0.521/-0.160/-0.990 us`，
+更接近测量波动或代码布局影响。
+
+最关键的阈值控制组是几乎同形状的 `compact_limit` 与 `compact_over_limit`：输出行恰好
+8 KiB、启用 Gather 的前者为 `18.770 us`；只多 2B、因超过阈值而回退旧路径的后者仅
+`12.311 us`。Gather 多耗时 `6.459 us`（`52.47%`）。`compact_batch_one=18.150 us`
+进一步表明，即使每核只处理一行，offset 初始化、Scalar/Vector 同步、GM→staging UB、Gather
+以及 compact UB→GM 的固定链路仍然过重，问题并非多行 stride 或 batch 阈值选择。
+
+因此本轮的正确结论不是继续缩放 8 KiB 或 batch 阈值，而是完整删除 staging + Gather 默认
+路径。它虽然把每批 MTE3 从输入数降到一次，却新增一份对齐 staging 写入、一遍 Vector Gather、
+offset 表构造和额外同步，增加的 UB 流量及控制成本超过了节省的 MTE3 命令。下一轮先用显式
+revert 恢复三个算子源码到 `2c97dca`，保留诊断 Case 和快速验证工具；之后单独实验 CANN
+内置 Concat 也采用的“按元素自然宽度进行 MTE 搬运”，避免继续叠加到已证负收益的分支上。
 
 ### 历史实验：复用 Host 预加载的片段字节数
 
@@ -702,7 +741,8 @@ INT32 四份 Ascend 910B Kernel 均生成成功，Host tiling、算子原型和 
 包为 `build_out/custom_opp_ubuntu_x86_64.run`；对最终 `.run` 文件执行 `sha256sum` 得到
 `d50e6c1ebf947c8eddf2c61dd7577e450e659d8e983ce621895564d7686ef21e`。无 NPU 环境中的
 `get platform info failed, drvErr=4` 不影响离线 `opc` 生成，但完整构建通过仍不等于设备运行
-正确，当前 Gather 修正版尚未经过 NPU 精度验证。
+正确。该 Gather 修正版随后已在本地 21 项和官方五项测试中通过精度，确认设备异常已修复；
+但官方总耗时 `586.496 us` 比历史最好慢 `12.884 us`，因此将从下一实验版本中撤销。
 
 ## 本地快速测试
 
