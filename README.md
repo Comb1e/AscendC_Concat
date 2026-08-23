@@ -124,6 +124,7 @@ Concat 不做数值计算，Kernel 使用 `uint8_t` 原始字节搬运统一覆�
 | `8f3c24b` | 增加每个 AIV 分别处理 1/2/8 个 64 KiB chunk 的流水隔离 Case | 测量队列深度对单次开销和跨迭代 MTE overlap 的不同影响 | 只增加测试，是本轮 A/B 基线 |
 | `763fc9a` | 将 TQueBind 逻辑队列深度从 2 降为 1，保持两个物理 Buffer | 删除无连续 EnQue 场景的环形队列管理，保留 Double Buffer | CANN 内置 Concat 使用深度 2，必须用 1/2/8 迭代 Case 判断是否损伤流水重叠 |
 | `4fe4967` | 快速验证输出逻辑队列深度、物理 Buffer 数和 Double Buffer 状态 | 防止后续把 queue depth 与 Buffer 数混淆 | 只验证源码配置，不验证设备 overlap |
+| `8a78122` | 将三项 pipeline Case 加入 `local_test/run.sh` 的可运行列表 | 让单 Case 与 `all` 都能实际执行新增测试 | 测试扩展无需重建，算子包仍需匹配待测 commit |
 
 ### 首轮 NPU 反馈与原因分析
 
