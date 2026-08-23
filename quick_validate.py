@@ -214,12 +214,20 @@ def validate_compact_addresses(case: CompactShape) -> tuple[int, int, int]:
     return staging_row_bytes, batch_rows, offset_buffer_bytes + batch_rows * bytes_per_batch_row
 
 
-def validate_kernel_source() -> bool:
+def validate_kernel_source() -> tuple[bool, int, int]:
     source = (ROOT / "op_kernel" / "concat.cpp").read_text(encoding="utf-8")
+    buffer_count_match = re.search(r"kBufferCount\s*=\s*(\d+)\s*;", source)
+    require(buffer_count_match is not None, "kernel buffer count was not found")
+    buffer_count = int(buffer_count_match.group(1))
+    queue_depth_match = re.search(r"kQueueDepth\s*=\s*(\d+)\s*;", source)
+    queue_depth = int(queue_depth_match.group(1)) if queue_depth_match else buffer_count
+    require(buffer_count == 2, f"expected Double Buffer count 2, got {buffer_count}")
+    require(queue_depth in (1, 2), f"unsupported queue depth {queue_depth}")
+
     gather_enabled = "ProcessFusedUnalignedRows" in source
     if not gather_enabled:
         require("tilingData.scheduleMode == 2" not in source, "partial staged Gather dispatch remains")
-        return False
+        return False, queue_depth, buffer_count
 
     stride_formula = re.compile(
         r"destinationStrideBlocks\s*=\s*"
@@ -231,7 +239,7 @@ def validate_kernel_source() -> bool:
     )
     require(stride_formula.search(source) is not None, "kernel UB dstStride is not in datablocks")
     require(copy_params.search(source) is not None, "staging copy does not use destinationStrideBlocks")
-    return True
+    return True, queue_depth, buffer_count
 
 
 def validate_known_cases() -> None:
@@ -308,7 +316,11 @@ def main() -> int:
     args = parser.parse_args()
     require(args.random_cases >= 0, "--random-cases must be nonnegative")
 
-    gather_enabled = validate_kernel_source()
+    gather_enabled, queue_depth, buffer_count = validate_kernel_source()
+    print(
+        f"KERNEL_PIPELINE queue_depth={queue_depth} buffer_count={buffer_count} "
+        "double_buffer=enabled status=pass"
+    )
     if gather_enabled:
         print("KERNEL_SOURCE staged_gather=enabled staged_ub_stride=datablocks status=pass")
     else:
