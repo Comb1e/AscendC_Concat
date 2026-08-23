@@ -47,7 +47,10 @@ staging + `Gather` 还必须按操作数所在存储位置逐项核对 Ext DMA s
 UB 侧为 32B datablock；同时核对所有 Vector UB 起点的 32B 对齐和 Scalar/Vector 流水依赖。
 静态地址模型与离线编译均通过，仍不能证明设备指令安全。
 出现 AIVEC/MTE 异常时应先建立精确 revert 点，再用最小本地 Case 验证修正版，不能直接提交
-官方测试。
+官方测试。纯搬运算子的 TQue 模板 `depth` 与 `InitBuffer` 的 Buffer 数是两个独立参数：前者
+控制同时在队列中的 Tensor 数和环形队列状态，后者为 2 才开启 Double Buffer；增加 Buffer
+数并不等于增加硬件流水级。910B Concat 只有 MTE2 与 MTE3 两个实质搬运阶段，没有 Vector
+Compute 阶段，三 Buffer 通常只会压缩单块 UB 空间，必须先用每核不同迭代数的 Case 证明收益。
 
 ## Kernel 地址模型
 
@@ -116,6 +119,10 @@ Concat 不做数值计算，Kernel 使用 `uint8_t` 原始字节搬运统一覆�
 | `cb1c4c5` | 增加 offset 对齐、非对齐输出尾行和单 batch 三个诊断 Case | 分离 offset 生成、MTE3 自动补齐与 `blockCount=1` 行为 | 只增加测试，不改变算子二进制 |
 | `e9a0c27` | 将 staging GM→UB 的目的 stride 恢复为 32B datablock 数 | 保留 offset 对齐修复，同时修复多行 staging MTE 写越界 | NPU 精度和设备安全已验证，但官方总耗时 `586.496 us`，性能判负 |
 | `6c4c10d` | 根目录增加 staged Gather 快速验证脚本 | 在无 NPU 环境拦截 stride 单位、UB 足迹、offset 和脚本语法回归 | 静态模型不能替代设备执行 |
+| `c1ff503` / `20c115b` | 依次撤销 Gather stride 修正和 Gather 实现 | 恢复官方历史最优算子源码 | 中间提交仍含错误字节 stride，不应单独测试；最终三个算子源码与 `2c97dca` 一致 |
+| `ef10c6e` | 快速验证脚本按源码探测 Gather 是否启用 | Gather 撤销后仍保留地址模型作为回归参考 | 禁用时必须同时确认 mode 2 dispatch 不残留 |
+| `8f3c24b` | 增加每个 AIV 分别处理 1/2/8 个 64 KiB chunk 的流水隔离 Case | 测量队列深度对单次开销和跨迭代 MTE overlap 的不同影响 | 只增加测试，是本轮 A/B 基线 |
+| `763fc9a` | 将 TQueBind 逻辑队列深度从 2 降为 1，保持两个物理 Buffer | 删除无连续 EnQue 场景的环形队列管理，保留 Double Buffer | CANN 内置 Concat 使用深度 2，必须用 1/2/8 迭代 Case 判断是否损伤流水重叠 |
 
 ### 首轮 NPU 反馈与原因分析
 
@@ -680,8 +687,49 @@ offset 生成确实消除了异常版本的一部分额外成本；但该比较�
 因此本轮的正确结论不是继续缩放 8 KiB 或 batch 阈值，而是完整删除 staging + Gather 默认
 路径。它虽然把每批 MTE3 从输入数降到一次，却新增一份对齐 staging 写入、一遍 Vector Gather、
 offset 表构造和额外同步，增加的 UB 流量及控制成本超过了节省的 MTE3 命令。下一轮先用显式
-revert 恢复三个算子源码到 `2c97dca`，保留诊断 Case 和快速验证工具；之后单独实验 CANN
-内置 Concat 也采用的“按元素自然宽度进行 MTE 搬运”，避免继续叠加到已证负收益的分支上。
+revert 恢复三个算子源码到 `2c97dca`，保留诊断 Case 和快速验证工具；之后单独实验 910B
+纯搬运队列深度，避免继续叠加到已证负收益的分支上。
+
+### 910B 设备参数与队列深度实验
+
+当前 Host 通过 `PlatformAscendC::GetCoreNumAiv()` 获取可用 AIV 数，平台信息缺失时才回退为
+910B 的 40；Kernel 仅注册 `ascend910b` 并声明 `KERNEL_TYPE_AIV_ONLY`。当前 Tiling/Kernel
+还显式遵守以下 220 架构约束：UB 为 192 KiB、UB 起点 32B 对齐，普通 `DataCopy` stride
+字段最多 65535 个 datablock，Ext 行数最多 4095，GM→UB 由 MTE2、UB→GM 由 MTE3 执行。
+32/64 KiB tile 乘两个 Buffer 分别占 64/128 KiB，不会吃满 UB；64 KiB 只在不降低 40 AIV
+占用时启用。官方硬件说明还指出 GM→UB 在满足 cache line（典型为 512B）访问时性能更好，
+但 Concat 的输出片段起点由输入前缀决定，不能通过越界扩写强行获得该对齐。
+
+增加“三流水级”不适合直接作为本轮默认方案。Concat 不执行 Vector Compute，实际只有 MTE2
+和 MTE3 两个异步阶段；`3 * 64 KiB` 会恰好占满 192 KiB UB，却没有第三个独立计算队列可以
+稳定隐藏。CANN 的 `InitBuffer(queue, 2, tileBytes)` 已经开启 Double Buffer，源码中紧邻的
+`CopyIn -> EnQue -> DeQue -> CopyOut` 也会由事件机制异步编排，不需要手工先搬入两块。
+
+真正可独立实验的是 TQueBind 的模板 `depth`。CANN 8.5 的通用 TQue 文档建议：没有连续两次
+`EnQue` 时深度设为 1，编译器能生成更紧凑代码；但本机内置 `arch35` Concat 纯搬运路径将
+模板深度和 Buffer 数都设为 2。两者不构成矛盾结论，因为产品架构和实现目标不同，也意味着
+不能只凭文档判定性能。`763fc9a` 因而只把逻辑深度改为 1，仍执行
+`InitBuffer(queue, 2, tileBytes)`；地址、DMA、tile、blockDim 和 Tiling 均不变。
+
+同一 CANN 8.5 工具链分别构建 `8f3c24b` 深度 2 基线和 `763fc9a` 深度 1 实验后，四种 DType
+的对象文件大小都保持 10192B，Kernel JSON 除 SHA256 外完全一致；但 ELF `.text` 从
+`0x1344=4932B` 降到 `0x1124=4388B`，减少 544B（`11.03%`）。这证明 CCE 实际删除了深度 2
+所需的 head/tail 环形队列代码，而不是把两份源码编译成相同指令。它只支持“Scalar 固定开销
+可能下降”的假设，不能证明 MTE2/MTE3 overlap 不受影响。
+
+新增 `pipeline_one_loop/two_loops/eight_loops` 都使用 40 个 AIV、64 KiB 对齐 chunk，分别让
+每核处理 1/2/8 次队列迭代。应在同一机器先测 `8f3c24b`，再测 `763fc9a`，同时比较中位数与
+均值。若单迭代改善但 2/8 迭代任一稳定回退超过 2%，说明深度 1 损伤跨迭代流水，应立即
+revert；若三项变化都小于约 `0.3 us` 且均值方向不一致，则判为无效，不提交官方系统；只有
+三项均不回退且现有 `ref/row_unaligned/row_aligned/chunk_aligned/many_inputs` 合计改善时，
+才运行五个官方 Case。
+
+本轮核对的官方资料：
+
+- [CANN 8.5 TPipe/TQue 编程范式](https://www.hiascend.com/document/detail/zh/canncommercial/850/opdevg/Ascendcopdevg/atlas_ascendc_10_00033.html)
+- [TQue 深度与连续 EnQue 建议](https://www.hiascend.com/document/detail/en/canncommercial/800/apiref/ascendcopapi/atlasascendc_api_07_0137.html)
+- [InitBuffer 的 Buffer 数与 Double Buffer](https://www.hiascend.com/document/detail/en/canncommercial/800/apiref/ascendcopapi/atlasascendc_api_07_0110.html)
+- [MTE2/MTE3 通路与 cache line 搬运](https://www.hiascend.com/document/detail/en/canncommercial/800/opdevg/Ascendcopdevg/atlas_ascendc_10_0010.html)
 
 ### 历史实验：复用 Host 预加载的片段字节数
 
@@ -735,21 +783,21 @@ bash build.sh
 
 成功后应在 `build_out/` 中得到 `custom_*.run`。构建脚本会重新生成 `.build/`，因此不要在该目录保存手工修改。
 
-本次开发环境没有 NPU。为避免系统默认 Python 3.13 缺少 CANN 依赖，本机将 CANN Python 3.9、
-`opc` 和 `ccec_compiler` 放到 `PATH` 后执行 `bash build.sh`。`e9a0c27` 的 FP16、FP32、INT8、
-INT32 四份 Ascend 910B Kernel 均生成成功，Host tiling、算子原型和 ACLNN 库均链接成功，最终
-包为 `build_out/custom_opp_ubuntu_x86_64.run`；对最终 `.run` 文件执行 `sha256sum` 得到
-`d50e6c1ebf947c8eddf2c61dd7577e450e659d8e983ce621895564d7686ef21e`。无 NPU 环境中的
-`get platform info failed, drvErr=4` 不影响离线 `opc` 生成，但完整构建通过仍不等于设备运行
-正确。该 Gather 修正版随后已在本地 21 项和官方五项测试中通过精度，确认设备异常已修复；
-但官方总耗时 `586.496 us` 比历史最好慢 `12.884 us`，因此将从下一实验版本中撤销。
+本次开发环境没有 NPU。系统默认 Python 3.13 缺少 CANN TVM 所需的 `decorator`，首次构建在
+`opc` 导入阶段失败，尚未进入 Kernel 编译；切换到本机 CANN Python 3.9 环境后成功。该问题
+不属于 `763fc9a` 的 CCE 编译错误。FP16、FP32、INT8、INT32 四份 Ascend 910B Kernel 均已
+生成，Host tiling、算子原型和 ACLNN 库均链接成功。当前包为
+`build_out/custom_opp_ubuntu_x86_64.run`，SHA256 是
+`9e1e930afcc74b5970289ce956da7549425c98285a933670fbe5697c47984ef2`。无 NPU 环境中的
+`get platform info failed, drvErr=4` 不影响离线 `opc` 生成，但完整构建仍不能证明设备性能。
 
 ## 本地快速测试
 
 仓库根目录的 `quick_validate.py` 不导入 PyTorch/CANN，也不需要 NPU。它通过 AST 读取
-`local_test/test_op.py` 中的关键 Case，检查当前 Kernel 是否把 staging UB `dstStride` 编码为
-datablock，复算 Gather offset、每个 burst 的 UB 起止地址、MTE3 源 footprint 和 160 KiB UB
-预算，并默认执行 20000 组随机边界模型以及所有本地 Python/Shell 脚本的语法检查：
+`local_test/test_op.py` 中的关键 Case，探测 staged Gather 是否启用；启用时检查 UB
+`dstStride` 的 datablock 单位，禁用时确认 mode 2 dispatch 没有残留。Gather 地址、每个 burst
+的 UB 起止地址、MTE3 源 footprint 和 160 KiB UB 预算模型作为历史实验回归继续保留。脚本
+默认执行 20000 组随机边界模型以及所有本地 Python/Shell 脚本的语法检查：
 
 ```bash
 python3 quick_validate.py
@@ -795,6 +843,9 @@ python3 quick_validate.py --build
 | `max_inputs` | ACLNN 256 输入上限的描述符回退路径 |
 | `rank4_axis0` | Rank4 首轴拼接、负/正轴地址模型和零长度片段 |
 | `tile_tail` | 输出行跨越 64 KiB tile 且存在非整 tile 尾块 |
+| `pipeline_one_loop` | 40 个 64 KiB chunk，每个 AIV 一次队列迭代，隔离队列固定开销 |
+| `pipeline_two_loops` | 80 个 64 KiB chunk，每个 AIV 两次迭代，检查最短跨迭代 overlap |
+| `pipeline_eight_loops` | 320 个 64 KiB chunk，每个 AIV 八次迭代，放大稳态 MTE2/MTE3 流水差异 |
 
 测试工具所需的 ACLNN/PyTorch NPU helper 已复制到
 `local_test/common/pytorch_npu_helper.hpp`，运行时不依赖 `test-ref/`，整个
@@ -915,51 +966,48 @@ PERF_RESULT name=<case> samples=20 median_us=<time> mean_us=<time> min_us=<time>
 
 ## NPU 验证
 
-先构建并安装当前累计版本。算子源码提交是 `e9a0c27`，其前一提交 `cb1c4c5` 只增加本地
-诊断 Case：
+当前实验算子源码提交是 `763fc9a`，A/B 基线 `8f3c24b` 只比它多一个队列深度。两者均已通过
+CANN 8.5 / Ascend 910B 四种 DType 离线构建，且不含 Gather 分支。先安装当前
+`build_out/custom_opp_ubuntu_x86_64.run`，测试扩展已经构建时不需要再次传 `--build`：
 
 ```bash
 git log --oneline -12
-# e9a0c27：修复 staging GM->UB 的 UB datablock stride
-# d8ebf9c：offset 对齐修复；其字节 dstStride 已由 e9a0c27 更正
+# 763fc9a：逻辑队列深度 1，物理 Buffer 数仍为 2
+# 8f3c24b：逻辑队列深度 2 的历史最优源码 A/B 基线
 
 bash build.sh
 # 按比赛环境原有流程安装 custom_*.run，运行精度与五个性能样例
 ```
 
-发生过 AIVEC 异常的设备应先按比赛环境流程恢复为可正常运行状态，再安装新包并启动全新测试
-进程。测试扩展已经构建时不需要再次传 `--build`。先运行每核单行 Case，验证 Gather offset
-与流水；再运行原始复现 Case，验证多行 staging stride。若任一项出现 AIVEC/MTE 异常，立即
-停止，不要继续执行 `all` 或提交官方测试：
+先运行三项流水隔离 Case，再运行一组现有通用 Case。若任一项精度失败或出现 AIVEC/MTE
+异常，立即停止，不要继续执行 `all` 或提交官方测试：
 
 ```bash
-CONCAT_CODE_COMMIT=e9a0c27 bash local_test/run.sh compact_batch_one
-CONCAT_CODE_COMMIT=e9a0c27 bash local_test/run.sh row_unaligned
-CONCAT_CODE_COMMIT=e9a0c27 bash local_test/run.sh compact_offset_aligned
-CONCAT_CODE_COMMIT=e9a0c27 bash local_test/run.sh compact_output_tail
-CONCAT_CODE_COMMIT=e9a0c27 bash local_test/run.sh ref
-CONCAT_CODE_COMMIT=e9a0c27 bash local_test/run.sh compact_zero_segments
-CONCAT_CODE_COMMIT=e9a0c27 bash local_test/run.sh row_unaligned_fp32
-CONCAT_CODE_COMMIT=e9a0c27 bash local_test/run.sh compact_limit
-CONCAT_CODE_COMMIT=e9a0c27 bash local_test/run.sh compact_over_limit
-CONCAT_CODE_COMMIT=e9a0c27 bash local_test/run.sh row_unaligned_int8
-CONCAT_CODE_COMMIT=e9a0c27 bash local_test/run.sh row_aligned
+CONCAT_CODE_COMMIT=763fc9a bash local_test/run.sh pipeline_one_loop
+CONCAT_CODE_COMMIT=763fc9a bash local_test/run.sh pipeline_two_loops
+CONCAT_CODE_COMMIT=763fc9a bash local_test/run.sh pipeline_eight_loops
+CONCAT_CODE_COMMIT=763fc9a bash local_test/run.sh ref
+CONCAT_CODE_COMMIT=763fc9a bash local_test/run.sh row_unaligned
+CONCAT_CODE_COMMIT=763fc9a bash local_test/run.sh row_aligned
+CONCAT_CODE_COMMIT=763fc9a bash local_test/run.sh chunk_aligned
+CONCAT_CODE_COMMIT=763fc9a bash local_test/run.sh many_inputs
 ```
 
-性能测试应先预热，再在相同环境重复运行并取中位数。请同时记录精度结果、SoC/CANN 版本和 commit：
+严格 A/B 需要在同一设备、同一环境构建并安装 `8f3c24b` 后运行相同八项，再切回 `763fc9a`
+重复。`local_test/run.sh` 已完成预热并同时记录中位数和均值。请同时记录精度结果、SoC/CANN
+版本和 commit：
 
 ```text
 commit: <git rev-parse --short HEAD 的输出>
-code_baseline: <算子源码 commit；当前为 e9a0c27>
+code_baseline: <算子源码 commit；当前实验为 763fc9a>
 soc/cann: <version>
 correctness: pass|fail
 times_us: <case1>, <case2>, <case3>, <case4>, <case5>
 ```
 
-本地测试优先回传上述 11 项的正确性与 `median/mean/min/max`。测试扩展已构建时无需因 Python
-Case 改动执行 `--build`。当前官方主要比较点是历史最好 `573.612 us`；`1d9435c` 因 Case1
-Run failed 没有合法总分。若修正版仍有设备异常或 FP16/FP32 小行明显回退，新建 revert 提交撤销
-`e9a0c27` 后再撤销 `d8ebf9c`，即可恢复 `9d82f80`/`2c97dca` 的算子源码，同时保留新增测试。
+本地测试优先回传上述八项的正确性与 `median/mean/min/max`。测试扩展已构建时无需因 Python
+Case 改动执行 `--build`。当前官方主要比较点是历史最好 `573.612 us`。若深度 1 判负，只需
+新建一个 revert 提交撤销 `763fc9a`，算子源码即可恢复 `8f3c24b`/`2c97dca`，同时保留新增测试。
 
 更早的累计版本顺序为：
 
