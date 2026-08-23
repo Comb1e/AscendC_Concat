@@ -302,11 +302,9 @@ __aicore__ inline void ProcessFusedUnalignedRows(ListTensorDesc& inputs,
                 source.SetGlobalBuffer(sourcePointers[inputIdx]);
                 const uint32_t alignedSegmentBytes = static_cast<uint32_t>(
                     AlignUpU64(segmentBytes, kDataBlockBytes));
-                const uint32_t destinationStrideBlocks =
-                    (tilingData.stagingRowBytes - alignedSegmentBytes) / kDataBlockBytes;
                 DataCopyExtParams copyInParams{
                     batchRows, segmentBytes, 0,
-                    destinationStrideBlocks, 0};
+                    tilingData.stagingRowBytes - alignedSegmentBytes, 0};
                 DataCopyPadExtParams<uint8_t> padParams{false, 0, 0, 0};
                 DataCopyPad(staging[stagingOffset],
                             source[(firstOuter + row) * segmentBytes], copyInParams, padParams);
