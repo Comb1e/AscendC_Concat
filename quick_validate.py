@@ -242,8 +242,41 @@ def validate_kernel_source() -> tuple[bool, int, int]:
     return True, queue_depth, buffer_count
 
 
+def validate_uniform_metadata(cases: dict[str, dict[str, Any]]) -> None:
+    host_source = (ROOT / "op_host" / "concat.cpp").read_text(encoding="utf-8")
+    tiling_source = (ROOT / "op_host" / "concat_tiling.h").read_text(encoding="utf-8")
+    kernel_source = (ROOT / "op_kernel" / "concat.cpp").read_text(encoding="utf-8")
+    require("tiling.set_allSegmentsSame" in host_source, "Host does not save allSegmentsSame")
+    require("tiling.set_uniformSegmentBytes" in host_source, "Host does not save uniformSegmentBytes")
+    require("TILING_DATA_FIELD_DEF(uint64_t, uniformSegmentBytes)" in tiling_source,
+            "uniformSegmentBytes is missing from tiling")
+    require("TILING_DATA_FIELD_DEF(uint32_t, allSegmentsSame)" in tiling_source,
+            "allSegmentsSame is missing from tiling")
+    require("if (tilingData.allSegmentsSame != 0)" in kernel_source,
+            "Kernel uniform metadata branch is missing")
+
+    expected = {
+        "preload_16": False,
+        "preload_17": True,
+        "max_inputs": True,
+        "many_inputs": False,
+        "uniform_chunk_max_inputs": True,
+    }
+    for name, should_use_uniform_path in expected.items():
+        require(name in cases, f"missing local case {name}")
+        shape = to_compact_shape(name, cases[name])
+        actual = (
+            len(shape.segment_bytes) > MAX_INPUTS
+            and len(set(shape.segment_bytes)) == 1
+        )
+        require(actual == should_use_uniform_path,
+                f"{name}: uniform metadata eligibility changed to {actual}")
+        print(f"UNIFORM_METADATA name={name} enabled={str(actual).lower()} status=pass")
+
+
 def validate_known_cases() -> None:
     cases = load_local_cases()
+    validate_uniform_metadata(cases)
     expected = {
         "ref": True,
         "row_unaligned": True,

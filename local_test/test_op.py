@@ -133,6 +133,12 @@ CASES = {
         "dim": -1,
         "splits": [1] * ACLNN_MAX_TENSOR_LIST_SIZE,
     },
+    "uniform_chunk_max_inputs": {
+        "shape": (1, 16777216),
+        "dtype": torch.int8,
+        "dim": -1,
+        "splits": [65536] * ACLNN_MAX_TENSOR_LIST_SIZE,
+    },
     "rank4_axis0": {
         "shape": (8, 4, 8, 16),
         "dtype": torch.float16,
