@@ -682,8 +682,8 @@ bash build.sh
 本次开发环境没有 NPU。为避免系统默认 Python 3.13 缺少 CANN 依赖，本机将 CANN Python 3.9、
 `opc` 和 `ccec_compiler` 放到 `PATH` 后执行 `bash build.sh`。`d8ebf9c` 的 FP16、FP32、INT8、
 INT32 四份 Ascend 910B Kernel 均生成成功，Host tiling、算子原型和 ACLNN 库均链接成功，最终
-包为 `build_out/custom_opp_ubuntu_x86_64.run`，构建日志 SHA256 为
-`a559c4706b73ade488de545c863e1ad95f0cd0a6cc85579e9608f956c5a157ad`。无 NPU 环境中的
+包为 `build_out/custom_opp_ubuntu_x86_64.run`；对最终 `.run` 文件执行 `sha256sum` 得到
+`3af1a3b15397e1244c9161763bb1a006ce48d1bb899322125aaef74463df6f19`。无 NPU 环境中的
 `get platform info failed, drvErr=4` 不影响离线 `opc` 生成，但完整构建通过仍不等于设备运行
 正确，当前 Gather 修正版尚未经过 NPU 精度验证。
 
